@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,12 +21,37 @@ from app.domain.exceptions import (
 from app.domain.models import (
     ACTIVE_PAYMENT_STATUSES,
     RETRYABLE_PAYMENT_STATUSES,
+    OutboxRecord,
     PaymentAttempt,
     PaymentStatus,
     Quote,
     QuoteLine,
     QuoteStatus,
 )
+
+ALLOWED_PAYMENT_TRANSITIONS = {
+    PaymentStatus.PENDING: {
+        PaymentStatus.PROCESSING,
+        PaymentStatus.CONFIRMED,
+        PaymentStatus.FAILED,
+        PaymentStatus.EXPIRED,
+        PaymentStatus.REJECTED,
+        PaymentStatus.UNKNOWN,
+    },
+    PaymentStatus.PROCESSING: {
+        PaymentStatus.CONFIRMED,
+        PaymentStatus.FAILED,
+        PaymentStatus.EXPIRED,
+        PaymentStatus.REJECTED,
+        PaymentStatus.UNKNOWN,
+    },
+    PaymentStatus.UNKNOWN: {
+        PaymentStatus.CONFIRMED,
+        PaymentStatus.FAILED,
+        PaymentStatus.EXPIRED,
+        PaymentStatus.REJECTED,
+    },
+}
 
 
 def dynamodb_resource(settings: Settings):
@@ -48,40 +75,45 @@ def ensure_table(settings: Settings):
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
 
-    table = dynamodb.create_table(
-        TableName=settings.dynamodb_table,
-        KeySchema=[
-            {"AttributeName": "PK", "KeyType": "HASH"},
-            {"AttributeName": "SK", "KeyType": "RANGE"},
-        ],
-        AttributeDefinitions=[
-            {"AttributeName": "PK", "AttributeType": "S"},
-            {"AttributeName": "SK", "AttributeType": "S"},
-            {"AttributeName": "GSI1PK", "AttributeType": "S"},
-            {"AttributeName": "GSI1SK", "AttributeType": "S"},
-            {"AttributeName": "GSI2PK", "AttributeType": "S"},
-            {"AttributeName": "GSI2SK", "AttributeType": "S"},
-        ],
-        GlobalSecondaryIndexes=[
-            {
-                "IndexName": "GSI1",
-                "KeySchema": [
-                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
-                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "ALL"},
-            },
-            {
-                "IndexName": "GSI2",
-                "KeySchema": [
-                    {"AttributeName": "GSI2PK", "KeyType": "HASH"},
-                    {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "ALL"},
-            },
-        ],
-        BillingMode="PAY_PER_REQUEST",
-    )
+    try:
+        table = dynamodb.create_table(
+            TableName=settings.dynamodb_table,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+                {"AttributeName": "GSI1PK", "AttributeType": "S"},
+                {"AttributeName": "GSI1SK", "AttributeType": "S"},
+                {"AttributeName": "GSI2PK", "AttributeType": "S"},
+                {"AttributeName": "GSI2SK", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "GSI1",
+                    "KeySchema": [
+                        {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "GSI2",
+                    "KeySchema": [
+                        {"AttributeName": "GSI2PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceInUseException":
+            raise
+        table = dynamodb.Table(settings.dynamodb_table)
     table.wait_until_exists()
     return table
 
@@ -166,7 +198,6 @@ def payment_to_item(payment: PaymentAttempt) -> dict[str, Any]:
 
 
 def payment_from_item(item: dict[str, Any]) -> PaymentAttempt:
-    dt = __import__("datetime").datetime
     return PaymentAttempt(
         payment_id=UUID(item["payment_id"]),
         order_id=UUID(item["order_id"]),
@@ -179,8 +210,43 @@ def payment_from_item(item: dict[str, Any]) -> PaymentAttempt:
         provider=item["provider"],
         provider_reference=item.get("provider_reference") or None,
         version=int(item["version"]),
-        created_at=dt.fromisoformat(item["created_at"]),
-        updated_at=dt.fromisoformat(item["updated_at"]),
+        created_at=datetime.fromisoformat(item["created_at"]),
+        updated_at=datetime.fromisoformat(item["updated_at"]),
+    )
+
+
+def outbox_to_item(record: OutboxRecord) -> dict[str, Any]:
+    return {
+        "PK": f"OUTBOX#{record.message_id}",
+        "SK": "META",
+        "entity_type": "OUTBOX",
+        "message_id": str(record.message_id),
+        "event_type": record.event_type,
+        "aggregate_id": str(record.aggregate_id),
+        "payload": record.payload,
+        "status": record.status,
+        "attempt_count": record.attempt_count,
+        "version": record.version,
+        "next_attempt_at": record.next_attempt_at.isoformat(),
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+        "GSI2PK": "OUTBOX#PENDING",
+        "GSI2SK": f"{record.next_attempt_at.isoformat()}#{record.message_id}",
+    }
+
+
+def outbox_from_item(item: dict[str, Any]) -> OutboxRecord:
+    return OutboxRecord(
+        message_id=UUID(item["message_id"]),
+        event_type=item["event_type"],
+        aggregate_id=UUID(item["aggregate_id"]),
+        payload=dict(item["payload"]),
+        next_attempt_at=datetime.fromisoformat(item["next_attempt_at"]),
+        status=item["status"],
+        attempt_count=int(item["attempt_count"]),
+        version=int(item["version"]),
+        created_at=datetime.fromisoformat(item["created_at"]),
+        updated_at=datetime.fromisoformat(item["updated_at"]),
     )
 
 
@@ -233,29 +299,70 @@ class FinanceRepository:
 
     def save_quote_transition(self, previous: Quote, updated: Quote) -> Quote:
         try:
-            response = self.table.update_item(
-                Key={"PK": f"QUOTE#{previous.quote_id}", "SK": "META"},
-                UpdateExpression=(
-                    "SET #status = :new_status, #version = :new_version, "
-                    "updated_at = :updated_at, rejection_reason = :reason"
-                ),
-                ConditionExpression="#status = :old_status AND #version = :old_version",
-                ExpressionAttributeNames={"#status": "status", "#version": "version"},
-                ExpressionAttributeValues={
-                    ":new_status": updated.status.value,
-                    ":new_version": updated.version,
-                    ":updated_at": updated.updated_at.isoformat(),
-                    ":reason": updated.rejection_reason or "",
-                    ":old_status": previous.status.value,
-                    ":old_version": previous.version,
-                },
-                ReturnValues="ALL_NEW",
+            self.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {"PK": f"QUOTE#{previous.quote_id}", "SK": "META"},
+                            "UpdateExpression": (
+                                "SET #status = :new_status, #version = :new_version, "
+                                "updated_at = :updated_at, rejection_reason = :reason"
+                            ),
+                            "ConditionExpression": (
+                                "#status = :old_status AND #version = :old_version"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#version": "version",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":new_status": updated.status.value,
+                                ":new_version": updated.version,
+                                ":updated_at": updated.updated_at.isoformat(),
+                                ":reason": updated.rejection_reason or "",
+                                ":old_status": previous.status.value,
+                                ":old_version": previous.version,
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {
+                                "PK": f"ORDER#{previous.order_id}",
+                                "SK": "QUOTE_GUARD",
+                            },
+                            "UpdateExpression": (
+                                "SET #status = :new_status, #version = :new_version"
+                            ),
+                            "ConditionExpression": (
+                                "quote_id = :quote_id AND #status = :old_status "
+                                "AND #version = :old_version"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#version": "version",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":quote_id": str(previous.quote_id),
+                                ":new_status": updated.status.value,
+                                ":new_version": updated.version,
+                                ":old_status": previous.status.value,
+                                ":old_version": previous.version,
+                            },
+                        }
+                    },
+                ]
             )
         except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            if exc.response["Error"]["Code"] == "TransactionCanceledException":
                 raise FinanceConflictError("Orçamento foi alterado concorrentemente") from exc
             raise
-        return quote_from_item(response["Attributes"])
+        stored = self.get_quote(previous.quote_id)
+        if stored is None:
+            raise FinanceNotFoundError("Orçamento desapareceu após transição")
+        return stored
 
     def get_payment(self, payment_id: UUID) -> PaymentAttempt | None:
         response = self.table.get_item(
@@ -264,6 +371,22 @@ class FinanceRepository:
         )
         item = response.get("Item")
         return payment_from_item(item) if item else None
+
+    def _get_idempotent_payment(
+        self,
+        *,
+        idem_key: dict[str, str],
+        request_hash: str,
+    ) -> PaymentAttempt | None:
+        existing = self.table.get_item(Key=idem_key, ConsistentRead=True).get("Item")
+        if existing is None:
+            return None
+        if existing["request_hash"] != request_hash:
+            raise IdempotencyConflictError("Chave reutilizada com payload diferente")
+        payment = self.get_payment(UUID(existing["payment_id"]))
+        if payment is None:
+            raise FinanceConflictError("Registro idempotente sem pagamento correspondente")
+        return payment
 
     def create_payment(
         self,
@@ -280,7 +403,7 @@ class FinanceRepository:
             "quote_id": str(quote_id),
             "quote_version": quote_version,
             "method": method,
-            "amount": str(amount),
+            "amount": format(amount.normalize(), "f"),
         }
         request_hash = hashlib.sha256(
             json.dumps(request_body, sort_keys=True).encode()
@@ -290,14 +413,12 @@ class FinanceRepository:
             "PK": f"IDEMPOTENCY#PAYMENT_CREATE#{order_id}#{key_hash}",
             "SK": "REQUEST",
         }
-        existing = self.table.get_item(Key=idem_key, ConsistentRead=True).get("Item")
-        if existing:
-            if existing["request_hash"] != request_hash:
-                raise IdempotencyConflictError("Chave reutilizada com payload diferente")
-            payment = self.get_payment(UUID(existing["payment_id"]))
-            if payment is None:
-                raise FinanceConflictError("Registro idempotente sem pagamento correspondente")
-            return payment
+        existing_payment = self._get_idempotent_payment(
+            idem_key=idem_key,
+            request_hash=request_hash,
+        )
+        if existing_payment is not None:
+            return existing_payment
 
         guard_key = {"PK": f"ORDER#{order_id}", "SK": "PAYMENT_GUARD"}
         guard = self.table.get_item(Key=guard_key, ConsistentRead=True).get("Item")
@@ -328,7 +449,13 @@ class FinanceRepository:
             "request_hash": request_hash,
             "payment_id": str(payment.payment_id),
             "response_status": payment.status.value,
+            "response": {
+                "payment_id": str(payment.payment_id),
+                "attempt_number": attempt_number,
+                "status": payment.status.value,
+            },
             "created_at": payment.created_at.isoformat(),
+            "updated_at": payment.updated_at.isoformat(),
         }
         guard_item = {
             **guard_key,
@@ -381,93 +508,188 @@ class FinanceRepository:
             )
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "TransactionCanceledException":
+                concurrent_payment = self._get_idempotent_payment(
+                    idem_key=idem_key,
+                    request_hash=request_hash,
+                )
+                if concurrent_payment is not None:
+                    return concurrent_payment
                 raise FinanceConflictError("Conflito concorrente ao criar pagamento") from exc
             raise
         return payment
 
     def confirm_payment(self, payment_id: UUID, provider_reference: str) -> PaymentAttempt:
+        if not provider_reference.strip():
+            raise FinanceConflictError("A referência externa é obrigatória")
+        return self.transition_payment_status(
+            payment_id,
+            PaymentStatus.CONFIRMED,
+            provider_reference=provider_reference,
+        )
+
+    def transition_payment_status(
+        self,
+        payment_id: UUID,
+        new_status: PaymentStatus,
+        *,
+        provider_reference: str | None = None,
+    ) -> PaymentAttempt:
         payment = self.get_payment(payment_id)
         if payment is None:
             raise FinanceNotFoundError("Pagamento não encontrado")
-        if payment.status == PaymentStatus.CONFIRMED:
+        if payment.status == new_status:
+            if (
+                new_status == PaymentStatus.CONFIRMED
+                and payment.provider_reference != provider_reference
+            ):
+                raise FinanceConflictError("Pagamento já confirmado com outra referência")
             return payment
-        if payment.status not in ACTIVE_PAYMENT_STATUSES:
-            raise FinanceConflictError("Pagamento não está ativo")
-        now = __import__("datetime").datetime.now(__import__("datetime").UTC)
-        lock = {
-            "PK": f"PROVIDER_REF#{payment.provider}#{provider_reference}",
-            "SK": "LOCK",
-            "payment_id": str(payment_id),
-        }
-        values = {
-            ":confirmed": PaymentStatus.CONFIRMED.value,
+        if new_status not in ALLOWED_PAYMENT_TRANSITIONS.get(payment.status, set()):
+            raise FinanceConflictError("Transição de pagamento não permitida")
+        if new_status == PaymentStatus.CONFIRMED and not provider_reference:
+            raise FinanceConflictError("A referência externa é obrigatória")
+        if new_status != PaymentStatus.CONFIRMED and provider_reference is not None:
+            raise FinanceConflictError("Referência externa só é aceita na confirmação")
+
+        guard_key = {"PK": f"ORDER#{payment.order_id}", "SK": "PAYMENT_GUARD"}
+        guard = self.table.get_item(Key=guard_key, ConsistentRead=True).get("Item")
+        if (
+            guard is None
+            or guard.get("payment_id") != str(payment_id)
+            or guard.get("status") != payment.status.value
+        ):
+            raise FinanceConflictError("PAYMENT_GUARD inconsistente com a tentativa")
+        guard_version = int(guard["version"])
+
+        now = datetime.now(UTC)
+        updated = replace(
+            payment,
+            status=new_status,
+            provider_reference=provider_reference,
+            version=payment.version + 1,
+            updated_at=now,
+        )
+        attempt_values = {
+            ":new_status": new_status.value,
             ":old": payment.status.value,
             ":version": payment.version,
-            ":new_version": payment.version + 1,
-            ":reference": provider_reference,
+            ":new_version": updated.version,
+            ":reference": provider_reference or "",
             ":updated": now.isoformat(),
         }
-        try:
-            self.client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Put": {
-                            "TableName": self.table.name,
-                            "Item": lock,
-                            "ConditionExpression": "attribute_not_exists(PK)",
-                        }
-                    },
-                    {
-                        "Update": {
-                            "TableName": self.table.name,
-                            "Key": {"PK": f"PAYMENT#{payment_id}", "SK": "META"},
-                            "UpdateExpression": (
-                                "SET #status=:confirmed, provider_reference=:reference, "
-                                "#version=:new_version, updated_at=:updated"
+        guard_values = {
+            ":new_status": new_status.value,
+            ":old": payment.status.value,
+            ":version": guard_version,
+            ":new_version": guard_version + 1,
+            ":payment_id": str(payment_id),
+        }
+        transaction: list[dict[str, Any]] = []
+        if new_status == PaymentStatus.CONFIRMED:
+            transaction.append(
+                {
+                    "Put": {
+                        "TableName": self.table.name,
+                        "Item": {
+                            "PK": (
+                                f"PROVIDER_REF#{payment.provider}#{provider_reference}"
                             ),
-                            "ConditionExpression": "#status=:old AND #version=:version",
-                            "ExpressionAttributeNames": {
-                                "#status": "status",
-                                "#version": "version",
-                            },
-                            "ExpressionAttributeValues": values,
-                        }
-                    },
-                    {
-                        "Update": {
-                            "TableName": self.table.name,
-                            "Key": {
-                                "PK": f"ORDER#{payment.order_id}",
-                                "SK": "PAYMENT_GUARD",
-                            },
-                            "UpdateExpression": "SET #status=:confirmed, #version=:new_version",
-                            "ConditionExpression": "payment_id=:payment_id AND #status=:old",
-                            "ExpressionAttributeNames": {
-                                "#status": "status",
-                                "#version": "version",
-                            },
-                            "ExpressionAttributeValues": {
-                                ":confirmed": PaymentStatus.CONFIRMED.value,
-                                ":new_version": payment.version + 1,
-                                ":payment_id": str(payment_id),
-                                ":old": payment.status.value,
-                            },
-                        }
-                    },
-                ]
+                            "SK": "LOCK",
+                            "payment_id": str(payment_id),
+                        },
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                }
             )
+        transaction.extend(
+            [
+                {
+                    "Update": {
+                        "TableName": self.table.name,
+                        "Key": {"PK": f"PAYMENT#{payment_id}", "SK": "META"},
+                        "UpdateExpression": (
+                            "SET #status=:new_status, provider_reference=:reference, "
+                            "#version=:new_version, updated_at=:updated"
+                        ),
+                        "ConditionExpression": "#status=:old AND #version=:version",
+                        "ExpressionAttributeNames": {
+                            "#status": "status",
+                            "#version": "version",
+                        },
+                        "ExpressionAttributeValues": attempt_values,
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": self.table.name,
+                        "Key": {
+                            "PK": f"ORDER#{payment.order_id}",
+                            "SK": "PAYMENT_GUARD",
+                        },
+                        "UpdateExpression": (
+                            "SET #status=:new_status, #version=:new_version"
+                        ),
+                        "ConditionExpression": (
+                            "payment_id=:payment_id AND #status=:old "
+                            "AND #version=:version"
+                        ),
+                        "ExpressionAttributeNames": {
+                            "#status": "status",
+                            "#version": "version",
+                        },
+                        "ExpressionAttributeValues": guard_values,
+                    }
+                },
+            ]
+        )
+        try:
+            self.client.transact_write_items(TransactItems=transaction)
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "TransactionCanceledException":
-                raise FinanceConflictError("Conflito ao confirmar pagamento") from exc
+                concurrent = self.get_payment(payment_id)
+                if (
+                    concurrent is not None
+                    and concurrent.status == new_status
+                    and concurrent.provider_reference == provider_reference
+                ):
+                    return concurrent
+                raise FinanceConflictError("Conflito ao atualizar pagamento") from exc
             raise
-        confirmed = self.get_payment(payment_id)
-        if confirmed is None:
-            raise FinanceNotFoundError("Pagamento desapareceu após confirmação")
-        return confirmed
+        stored = self.get_payment(payment_id)
+        if stored is None:
+            raise FinanceNotFoundError("Pagamento desapareceu após atualização")
+        return stored
+
+    def save_outbox_record(self, record: OutboxRecord) -> OutboxRecord:
+        try:
+            self.table.put_item(
+                Item=outbox_to_item(record),
+                ConditionExpression="attribute_not_exists(PK)",
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise FinanceConflictError("Mensagem da Outbox já existe") from exc
+            raise
+        return record
+
+    def get_outbox_record(self, message_id: UUID) -> OutboxRecord | None:
+        response = self.table.get_item(
+            Key={"PK": f"OUTBOX#{message_id}", "SK": "META"},
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        return outbox_from_item(item) if item else None
 
     def list_order_history(self, order_id: UUID) -> list[dict[str, Any]]:
-        response = self.table.query(
-            IndexName="GSI1",
-            KeyConditionExpression=Key("GSI1PK").eq(f"ORDER#{order_id}"),
-        )
-        return response.get("Items", [])
+        items: list[dict[str, Any]] = []
+        query: dict[str, Any] = {
+            "IndexName": "GSI1",
+            "KeyConditionExpression": Key("GSI1PK").eq(f"ORDER#{order_id}"),
+        }
+        while True:
+            response = self.table.query(**query)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if last_key is None:
+                return items
+            query["ExclusiveStartKey"] = last_key

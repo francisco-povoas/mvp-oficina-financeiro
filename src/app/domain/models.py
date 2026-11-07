@@ -143,3 +143,15 @@ class OutboxRecord:
     payload: dict[str, object]
     next_attempt_at: datetime
     status: str = "PENDING"
+    attempt_count: int = 0
+    version: int = 1
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not self.event_type.strip():
+            raise ValueError("O tipo do evento da Outbox é obrigatório")
+        if self.status != "PENDING":
+            raise ValueError("A Outbox estrutural da Etapa 1 aceita somente registros pendentes")
+        if self.attempt_count != 0:
+            raise ValueError("Retentativas da Outbox pertencem à Etapa 2")

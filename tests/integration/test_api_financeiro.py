@@ -1,11 +1,14 @@
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.infrastructure.dynamodb import ensure_table
 from app.main import create_app
 from app.security.jwt import JWTProvider
+
+pytestmark = pytest.mark.integration
 
 
 def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
