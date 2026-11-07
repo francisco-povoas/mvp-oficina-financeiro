@@ -1,0 +1,23 @@
+services:
+  dynamodb-test:
+    image: amazon/dynamodb-local:2.6.1
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    working_dir: /home/dynamodblocal
+
+  tests:
+    build:
+      context: .
+      target: test
+    environment:
+      ENVIRONMENT: test
+      LOG_LEVEL: WARNING
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-test:8000
+      DYNAMODB_TABLE: mvp-oficina-financeiro-test
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      JWT_SECRET_KEY: chave-ficticia-exclusiva-para-testes
+      JWT_ALGORITHM: HS256
+    command: pytest --cov=src/app --cov-report=term-missing --cov-report=xml:coverage.xml
+    depends_on:
+      - dynamodb-test

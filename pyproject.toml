@@ -1,0 +1,25 @@
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "unit: testes sem dependências externas",
+  "integration: testes com DynamoDB Local",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/app"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_empty = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
