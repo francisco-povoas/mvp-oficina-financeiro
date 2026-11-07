@@ -1,0 +1,72 @@
+[
+  {
+    "message_id": "00000000-0000-4000-8000-100000000001",
+    "message_type": "QuoteCommunicated",
+    "message_version": 1,
+    "occurred_at": "2026-11-07T15:00:00Z",
+    "correlation_id": "10000000-0000-4000-8000-100000000001",
+    "causation_id": null,
+    "operation_id": "20000000-0000-4000-8000-100000000001",
+    "saga_id": null,
+    "payload": {
+      "order_id": "30000000-0000-4000-8000-100000000001",
+      "quote_id": "40000000-0000-4000-8000-100000000001",
+      "quote_version": 1,
+      "total": "250.00",
+      "communicated_at": "2026-11-07T15:00:00Z"
+    }
+  },
+  {
+    "message_id": "00000000-0000-4000-8000-100000000002",
+    "message_type": "QuoteApproved",
+    "message_version": 1,
+    "occurred_at": "2026-11-07T15:05:00Z",
+    "correlation_id": "10000000-0000-4000-8000-100000000001",
+    "causation_id": "00000000-0000-4000-8000-100000000001",
+    "operation_id": "20000000-0000-4000-8000-100000000002",
+    "saga_id": null,
+    "payload": {
+      "order_id": "30000000-0000-4000-8000-100000000001",
+      "quote_id": "40000000-0000-4000-8000-100000000001",
+      "quote_version": 2,
+      "approved_at": "2026-11-07T15:05:00Z"
+    }
+  },
+  {
+    "message_id": "00000000-0000-4000-8000-100000000003",
+    "message_type": "QuoteRejected",
+    "message_version": 1,
+    "occurred_at": "2026-11-07T15:05:00Z",
+    "correlation_id": "10000000-0000-4000-8000-100000000001",
+    "causation_id": "00000000-0000-4000-8000-100000000001",
+    "operation_id": "20000000-0000-4000-8000-100000000003",
+    "saga_id": null,
+    "payload": {
+      "order_id": "30000000-0000-4000-8000-100000000001",
+      "quote_id": "40000000-0000-4000-8000-100000000001",
+      "quote_version": 2,
+      "reason": "Cliente recusou o orçamento",
+      "rejected_at": "2026-11-07T15:05:00Z"
+    }
+  },
+  {
+    "message_id": "00000000-0000-4000-8000-100000000004",
+    "message_type": "PaymentConfirmed",
+    "message_version": 1,
+    "occurred_at": "2026-11-07T16:00:00Z",
+    "correlation_id": "10000000-0000-4000-8000-100000000002",
+    "causation_id": null,
+    "operation_id": "20000000-0000-4000-8000-100000000004",
+    "saga_id": null,
+    "payload": {
+      "order_id": "30000000-0000-4000-8000-100000000001",
+      "quote_id": "40000000-0000-4000-8000-100000000001",
+      "quote_version": 2,
+      "payment_id": "50000000-0000-4000-8000-100000000001",
+      "status": "CONFIRMED",
+      "amount": "250.00",
+      "confirmed_at": "2026-11-07T16:00:00Z"
+    }
+  }
+]
+

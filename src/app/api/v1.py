@@ -9,8 +9,13 @@ from app.application.services import FinanceService
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
 from app.domain.models import PaymentAttempt, Quote, QuoteLine
 from app.infrastructure.dynamodb import FinanceRepository, ensure_table
+from app.security.auth import require_user
 
-router = APIRouter(prefix="/api/v1", tags=["Financeiro"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["Financeiro"],
+    dependencies=[Depends(require_user)],
+)
 
 
 class QuoteLineRequest(BaseModel):

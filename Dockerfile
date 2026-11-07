@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY pyproject.toml .
 COPY src ./src
 COPY tests ./tests
+COPY contracts ./contracts
 
 CMD ["pytest", "--cov=src/app", "--cov-report=term-missing"]
 

@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     dynamodb_table: str = ""
     jwt_secret_key: str = "unsafe"
     jwt_algorithm: Literal["HS256"] = "HS256"
+    jwt_access_token_expire_minutes: int = 30
+    jwt_issuer: str = "mvp-oficina-ordens"
+    jwt_user_audience: str = "mvp-oficina-users"
 
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 

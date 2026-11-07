@@ -1,0 +1,113 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MVP Oficina Financeiro — API interna",
+    "version": "1.0.0",
+    "description": "Reconciliação financeira autoritativa. Implementação funcional planejada para a Etapa 2."
+  },
+  "servers": [{"url": "http://mvp-oficina-financeiro/internal/v1"}],
+  "paths": {
+    "/orders/{order_id}/financial-status": {
+      "get": {
+        "operationId": "getFinancialStatus",
+        "x-implementation-status": "planned-stage-2",
+        "x-required-scopes": ["finance:status:read"],
+        "security": [{"serviceBearer": []}],
+        "parameters": [
+          {"$ref": "#/components/parameters/OrderId"},
+          {"$ref": "#/components/parameters/CorrelationId"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Projeção financeira autoritativa",
+            "headers": {"X-Correlation-ID": {"schema": {"type": "string", "format": "uuid"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FinancialStatus"}}}
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "501": {"$ref": "#/components/responses/Planned"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceBearer": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+    },
+    "parameters": {
+      "OrderId": {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "CorrelationId": {"name": "X-Correlation-ID", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Mesma chave e payload devolvem a mesma tentativa; payload divergente gera 409 e a chave não expira automaticamente.",
+        "schema": {"type": "string", "minLength": 8, "maxLength": 128}
+      }
+    },
+    "schemas": {
+      "FinancialStatus": {
+        "type": "object",
+        "required": ["order_id", "quote", "payment", "reconciled_at"],
+        "properties": {
+          "order_id": {"type": "string", "format": "uuid"},
+          "quote": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/QuoteStatus"},
+              {"type": "null"}
+            ]
+          },
+          "payment": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/PaymentStatus"},
+              {"type": "null"}
+            ]
+          },
+          "reconciled_at": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": false
+      },
+      "QuoteStatus": {
+        "type": "object",
+        "required": ["quote_id", "quote_version", "status", "total"],
+        "properties": {
+          "quote_id": {"type": "string", "format": "uuid"},
+          "quote_version": {"type": "integer", "minimum": 1},
+          "status": {"enum": ["RASCUNHO", "COMUNICADO", "APROVADO", "RECUSADO"]},
+          "total": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{2})$"}
+        },
+        "additionalProperties": false
+      },
+      "PaymentStatus": {
+        "type": "object",
+        "required": ["payment_id", "status", "amount", "confirmed_at"],
+        "properties": {
+          "payment_id": {"type": "string", "format": "uuid"},
+          "status": {"enum": ["PENDING", "PROCESSING", "FAILED", "EXPIRED", "REJECTED", "CONFIRMED"]},
+          "amount": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{2})$"},
+          "confirmed_at": {"type": ["string", "null"], "format": "date-time"}
+        },
+        "additionalProperties": false
+      },
+      "Problem": {
+        "type": "object",
+        "required": ["code", "message", "correlation_id"],
+        "properties": {
+          "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+          "message": {"type": "string"},
+          "correlation_id": {"type": "string", "format": "uuid"},
+          "operation_id": {"type": ["string", "null"], "format": "uuid"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "Unauthorized": {"description": "Token ausente, inválido, expirado, de tipo incorreto ou para outra audiência", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Problem"}}}},
+      "Forbidden": {"description": "Escopo insuficiente", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Problem"}}}},
+      "NotFound": {"description": "Estado financeiro não encontrado", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Problem"}}}},
+      "Planned": {"description": "Contrato materializado; integração funcional pertence à Etapa 2", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Problem"}}}}
+    }
+  }
+}
+

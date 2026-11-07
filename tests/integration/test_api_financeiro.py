@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.infrastructure.dynamodb import ensure_table
 from app.main import create_app
+from app.security.jwt import JWTProvider
 
 
 def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
@@ -17,6 +18,17 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
     line_id = str(uuid4())
     try:
         with TestClient(create_app(settings)) as client:
+            token = JWTProvider(
+                settings.jwt_secret_key,
+                settings.jwt_access_token_expire_minutes,
+                settings.jwt_algorithm,
+                settings.jwt_issuer,
+            ).create_user_token(
+                subject=str(uuid4()),
+                roles=["Atendente"],
+                audience=settings.jwt_user_audience,
+            )["access_token"]
+            client.headers.update({"Authorization": f"Bearer {token}"})
             created = client.post(
                 "/api/v1/quotes",
                 json={
