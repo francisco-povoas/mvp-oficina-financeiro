@@ -8,6 +8,7 @@ from app.main import create_app
 from app.security.jwt import JWTProvider
 
 SECRET = "segredo-hs256-exclusivo-dos-testes"
+CORRELATION_ID = str(uuid4())
 
 
 def _settings() -> Settings:
@@ -46,14 +47,21 @@ def test_internal_finance_endpoint_requires_exact_service_token() -> None:
     path = f"/internal/v1/orders/{uuid4()}/financial-status"
 
     with TestClient(create_app(settings)) as client:
-        assert client.get(path).status_code == 401
-        assert client.get(path, headers={"Authorization": f"Bearer {user}"}).status_code == 401
+        headers = {"X-Correlation-ID": CORRELATION_ID}
+        assert client.get(path, headers=headers).status_code == 401
+        assert client.get(
+            path,
+            headers={**headers, "Authorization": f"Bearer {user}"},
+        ).status_code == 401
         wrong_scope_response = client.get(
             path,
-            headers={"Authorization": f"Bearer {wrong_scope}"},
+            headers={**headers, "Authorization": f"Bearer {wrong_scope}"},
         )
         assert wrong_scope_response.status_code == 403
-        assert client.get(path, headers={"Authorization": f"Bearer {correct}"}).status_code == 501
+        assert client.get(
+            path,
+            headers={**headers, "Authorization": f"Bearer {correct}"},
+        ).status_code == 501
 
 
 def test_public_finance_endpoint_rejects_service_token_before_persistence() -> None:
