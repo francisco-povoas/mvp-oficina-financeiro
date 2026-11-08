@@ -1,34 +1,54 @@
 # MVP Oficina — Financeiro
 
-Microsserviço responsável por orçamentos, aprovação, recusa, comunicações e pagamentos da oficina.
+Microsserviço da Fase 4 responsável por orçamentos, aprovação, recusa, comunicações,
+pagamentos e histórico financeiro da oficina.
 
-## Estado atual
+## Estado da Etapa 1
 
-O recorte independente da Etapa 1 está disponível com persistência DynamoDB para
-orçamentos, snapshots e histórico de tentativas de pagamento. Guards, idempotência,
-referências externas, concorrência otimista e a estrutura persistente da Outbox são
-validados contra DynamoDB Local.
+O serviço usa uma tabela DynamoDB por ambiente, em modelo de tabela única. Orçamentos,
+snapshots, comunicações, tentativas, guards, idempotência e histórico são persistidos
+por chaves PK/SK e operações condicionais; `GSI1` atende consultas por OS e `GSI2`
+reserva o acesso da futura Outbox.
 
-A geração exige contexto da OS em `DIAGNOSTICO_CONCLUIDO`, ao menos um serviço
-ativo e snapshots com e-mail e telefone. A comunicação é um registro local de
-evidências: uma tentativa de WhatsApp e uma de e-mail por rodada. Somente uma rodada
-com as duas evidências bem-sucedidas promove o orçamento de `RASCUNHO` para
-`COMUNICADO`. O serviço não envia mensagens externas nesta etapa; o histórico pode ser
-consultado em `GET /api/v1/quotes/{quote_id}/communications`.
+A aplicação segue as fronteiras `domain` → `application` → ports. O composition root
+em `create_app` instancia `DynamoDBFinanceRepository` e
+`SimulatedPaymentProvider`, constrói `FinanceService` e o expõe à apresentação. As
+rotas não importam infraestrutura. O bootstrap idempotente da tabela é executado por
+`scripts/start.sh` antes do Uvicorn e não durante requisições; testes criam tabelas
+isoladas explicitamente.
 
-## Estrutura inicial
+## Comportamento financeiro
 
-- `src/app/`: aplicação FastAPI e camadas próprias de domínio e persistência;
-- `tests/`: testes próprios do serviço;
-- `docs/`: contratos e documentação próprios;
-- `compose.yaml`: API e DynamoDB Local de desenvolvimento;
-- `compose.test.yaml`: testes isolados com DynamoDB Local em memória.
+- A geração de orçamento exige contexto válido da OS e grava snapshots próprios.
+- Comunicações registram localmente as evidências de WhatsApp e e-mail; nenhum envio
+  externo ocorre nesta etapa.
+- Guards e versão otimista protegem as transições de orçamento e pagamento.
+- Chaves idempotentes evitam duplicação e conflito silencioso de tentativas.
+- O histórico por OS preserva tentativas e estados financeiros, inclusive resultados
+  técnicos inconclusivos.
+- A confirmação usa um provider simulado atrás de `PaymentProviderPort`; Mercado Pago
+  não está implementado.
 
-O serviço usa uma tabela DynamoDB por ambiente e mantém snapshots financeiros próprios,
-sem reutilizar modelos ORM ou consultar bancos dos demais serviços. A Outbox ainda é
-somente estrutural: publicação, polling, workers, Inbox e mensageria pertencem à Etapa 2.
+A estrutura de Outbox é apenas persistente. Eventos, publicação, polling, Inbox,
+workers e SQS/ElasticMQ pertencem à Etapa 2. Os contratos versionados em `contracts/`
+também não significam que a consulta REST a Ordens já esteja integrada.
 
-## Comandos
+## Estrutura
+
+| Caminho | Responsabilidade |
+|---|---|
+| `src/app/domain/` | modelos e exceções financeiras |
+| `src/app/application/` | casos de uso e ports de persistência/pagamento |
+| `src/app/infrastructure/` | adapter DynamoDB, provider simulado e bootstrap |
+| `src/app/presentation/` e `src/app/api/` | injeção e rotas HTTP |
+| `contracts/` | OpenAPI interno e eventos financeiros versionados |
+| `tests/` | testes unitários, arquiteturais, contratuais e DynamoDB Local |
+| `.github/workflows/ci.yml` | Ruff, suítes com cobertura mínima de 80% e build da imagem |
+
+Os manifests Kubernetes específicos serão materializados somente na Etapa 4, junto da
+preparação do deployment AWS. A Etapa 1 não contém placeholders Kubernetes.
+
+## Execução e validação
 
 ```bash
 make install
@@ -40,4 +60,12 @@ docker compose -f compose.test.yaml run --rm --build tests
 docker compose -f compose.test.yaml down --volumes --remove-orphans
 ```
 
-O health check fica disponível em `GET /health` na porta `8003`.
+O health check fica em `GET /health` na porta `8003`. O CI provisiona DynamoDB Local,
+executa bootstrap, lint, testes unitários/contratuais/de integração, gate global de
+cobertura e build sem publicar a imagem.
+
+## Próximas integrações
+
+A Etapa 2 implementará consulta a Ordens, eventos financeiros, Outbox/Inbox e workers.
+Infraestrutura Kubernetes/AWS será preparada na Etapa 4. O adapter real do Mercado
+Pago, Pix e webhooks pertence somente à Etapa 5.
