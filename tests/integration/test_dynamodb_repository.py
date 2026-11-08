@@ -1,3 +1,4 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ pytestmark = pytest.mark.integration
 def make_settings(table_name: str | None = None) -> Settings:
     return Settings(
         environment="test",
-        dynamodb_endpoint_url="http://dynamodb-test:8000",
+        dynamodb_endpoint_url=os.environ["DYNAMODB_ENDPOINT_URL"],
         dynamodb_table=table_name or f"mvp-oficina-financeiro-test-{uuid4().hex}",
     )
 

@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ pytestmark = pytest.mark.integration
 def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
     settings = Settings(
         environment="test",
-        dynamodb_endpoint_url="http://dynamodb-test:8000",
+        dynamodb_endpoint_url=os.environ["DYNAMODB_ENDPOINT_URL"],
         dynamodb_table=f"mvp-oficina-financeiro-api-{uuid4().hex}",
     )
     order_id = str(uuid4())
@@ -126,7 +127,7 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
 def test_quote_and_communication_http_invariants() -> None:
     settings = Settings(
         environment="test",
-        dynamodb_endpoint_url="http://dynamodb-test:8000",
+        dynamodb_endpoint_url=os.environ["DYNAMODB_ENDPOINT_URL"],
         dynamodb_table=f"mvp-oficina-financeiro-api-rules-{uuid4().hex}",
     )
     try:
