@@ -91,9 +91,15 @@ class FinanceService:
         self,
         quote_id: UUID,
         evidences: tuple[QuoteCommunicationEvidence, ...],
+        *,
+        correlation_id: UUID | None = None,
     ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.record_quote_communication(quote, evidences)
+        return self.repository.record_quote_communication(
+            quote,
+            evidences,
+            correlation_id=correlation_id,
+        )
 
     def get_quote(self, quote_id: UUID) -> Quote:
         return self._get_quote(quote_id)
@@ -104,13 +110,32 @@ class FinanceService:
         self._get_quote(quote_id)
         return self.repository.list_quote_communications(quote_id)
 
-    def approve_quote(self, quote_id: UUID) -> Quote:
+    def approve_quote(
+        self,
+        quote_id: UUID,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.save_quote_transition(quote, quote.aprovar())
+        return self.repository.save_quote_transition(
+            quote,
+            quote.aprovar(),
+            correlation_id=correlation_id,
+        )
 
-    def reject_quote(self, quote_id: UUID, reason: str | None) -> Quote:
+    def reject_quote(
+        self,
+        quote_id: UUID,
+        reason: str | None,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.save_quote_transition(quote, quote.recusar(reason))
+        return self.repository.save_quote_transition(
+            quote,
+            quote.recusar(reason),
+            correlation_id=correlation_id,
+        )
 
     def create_payment(
         self,
@@ -163,13 +188,19 @@ class FinanceService:
         )
 
     def confirm_simulated_payment(
-        self, payment_id: UUID, provider_reference: str
+        self,
+        payment_id: UUID,
+        provider_reference: str,
+        *,
+        correlation_id: UUID | None = None,
     ) -> PaymentAttempt:
         confirmation = self.payment_provider.confirm_payment(
             payment_id, provider_reference
         )
         return self.repository.confirm_payment(
-            payment_id, confirmation.provider_reference
+            payment_id,
+            confirmation.provider_reference,
+            correlation_id=correlation_id,
         )
 
     def get_financial_status(

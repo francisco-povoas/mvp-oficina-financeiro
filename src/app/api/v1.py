@@ -164,6 +164,7 @@ def get_quote(quote_id: UUID, service: ServiceDep) -> dict:
 def communicate_quote(
     quote_id: UUID,
     body: CommunicateQuoteRequest,
+    request: Request,
     service: ServiceDep,
 ) -> dict:
     def operation() -> Quote:
@@ -177,7 +178,11 @@ def communicate_quote(
             )
             for value in body.evidences
         )
-        return service.communicate_quote(quote_id, evidences)
+        return service.communicate_quote(
+            quote_id,
+            evidences,
+            correlation_id=request.state.correlation_id,
+        )
 
     return _transition(operation)
 
@@ -197,13 +202,29 @@ def list_quote_communications(quote_id: UUID, service: ServiceDep) -> list[dict]
 
 
 @router.post("/quotes/{quote_id}/approve", dependencies=[_ADMIN_ATENDENTE])
-def approve_quote(quote_id: UUID, service: ServiceDep) -> dict:
-    return _transition(lambda: service.approve_quote(quote_id))
+def approve_quote(quote_id: UUID, request: Request, service: ServiceDep) -> dict:
+    return _transition(
+        lambda: service.approve_quote(
+            quote_id,
+            correlation_id=request.state.correlation_id,
+        )
+    )
 
 
 @router.post("/quotes/{quote_id}/reject", dependencies=[_ADMIN_ATENDENTE])
-def reject_quote(quote_id: UUID, body: RejectQuoteRequest, service: ServiceDep) -> dict:
-    return _transition(lambda: service.reject_quote(quote_id, body.reason))
+def reject_quote(
+    quote_id: UUID,
+    body: RejectQuoteRequest,
+    request: Request,
+    service: ServiceDep,
+) -> dict:
+    return _transition(
+        lambda: service.reject_quote(
+            quote_id,
+            body.reason,
+            correlation_id=request.state.correlation_id,
+        )
+    )
 
 
 def _transition(operation) -> dict:
@@ -243,11 +264,18 @@ def create_payment(
     dependencies=[_ADMIN_ATENDENTE],
 )
 def confirm_payment(
-    payment_id: UUID, body: ConfirmPaymentRequest, service: ServiceDep
+    payment_id: UUID,
+    body: ConfirmPaymentRequest,
+    request: Request,
+    service: ServiceDep,
 ) -> dict:
     try:
         return _payment_response(
-            service.confirm_simulated_payment(payment_id, body.provider_reference)
+            service.confirm_simulated_payment(
+                payment_id,
+                body.provider_reference,
+                correlation_id=request.state.correlation_id,
+            )
         )
     except FinanceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

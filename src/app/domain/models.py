@@ -27,6 +27,11 @@ class PaymentStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class OutboxStatus(StrEnum):
+    PENDING = "PENDING"
+    PUBLISHED = "PUBLISHED"
+
+
 ACTIVE_PAYMENT_STATUSES = {
     PaymentStatus.PENDING,
     PaymentStatus.PROCESSING,
@@ -239,23 +244,65 @@ class PaymentAttempt:
 
 @dataclass(frozen=True, kw_only=True)
 class OutboxRecord:
-    """Estrutura persistente prevista; publicação começa somente na Etapa 2."""
+    """Registro publicavel e reivindicavel da Outbox financeira."""
 
     message_id: UUID
     event_type: str
+    event_version: int
     aggregate_id: UUID
     payload: dict[str, object]
+    correlation_id: UUID
+    operation_id: UUID
+    occurred_at: datetime
     next_attempt_at: datetime
-    status: str = "PENDING"
+    causation_id: UUID | None = None
+    status: OutboxStatus = OutboxStatus.PENDING
     attempt_count: int = 0
     version: int = 1
+    claim_id: UUID | None = None
+    claimed_by: str | None = None
+    claimed_at: datetime | None = None
+    claim_expires_at: datetime | None = None
+    published_at: datetime | None = None
+    last_error: str | None = None
+    last_failed_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
         if not self.event_type.strip():
             raise ValueError("O tipo do evento da Outbox é obrigatório")
-        if self.status != "PENDING":
-            raise ValueError("A Outbox estrutural da Etapa 1 aceita somente registros pendentes")
-        if self.attempt_count != 0:
-            raise ValueError("Retentativas da Outbox pertencem à Etapa 2")
+        if self.event_version < 1:
+            raise ValueError("A versão do evento da Outbox deve ser positiva")
+        if not self.event_type.endswith(f".v{self.event_version}"):
+            raise ValueError("O tipo e a versão do evento da Outbox são incompatíveis")
+        if self.attempt_count < 0:
+            raise ValueError("A quantidade de tentativas não pode ser negativa")
+        if self.version < 1:
+            raise ValueError("A versão da Outbox deve ser positiva")
+        timestamps = (
+            self.occurred_at,
+            self.next_attempt_at,
+            self.created_at,
+            self.updated_at,
+        )
+        if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
+            raise ValueError("Datas obrigatórias da Outbox devem possuir fuso horário")
+        claim = (self.claim_id, self.claimed_by, self.claimed_at, self.claim_expires_at)
+        if any(value is None for value in claim) and any(value is not None for value in claim):
+            raise ValueError("O claim da Outbox deve ser preenchido integralmente")
+        if (
+            self.claimed_at is not None
+            and self.claim_expires_at is not None
+            and self.claim_expires_at <= self.claimed_at
+        ):
+            raise ValueError("A expiração do claim deve ser posterior ao início")
+        if self.status == OutboxStatus.PENDING and self.published_at is not None:
+            raise ValueError("Outbox pendente não pode possuir data de publicação")
+        if self.status == OutboxStatus.PUBLISHED:
+            if self.published_at is None:
+                raise ValueError("Outbox publicada deve possuir data de publicação")
+            if self.claim_id is not None:
+                raise ValueError("Outbox publicada não pode manter claim")
+        if self.last_failed_at is not None and not self.last_error:
+            raise ValueError("Falha da Outbox deve possuir descrição")

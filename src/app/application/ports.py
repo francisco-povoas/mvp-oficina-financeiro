@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
 from app.domain.models import (
+    OutboxRecord,
     PaymentAttempt,
     Quote,
     QuoteCommunicationEvidence,
@@ -21,13 +23,21 @@ class FinanceRepositoryPort(Protocol):
         self,
         quote: Quote,
         evidences: tuple[QuoteCommunicationEvidence, ...],
+        *,
+        correlation_id: UUID | None = None,
     ) -> Quote: ...
 
     def list_quote_communications(
         self, quote_id: UUID
     ) -> list[QuoteCommunicationEvidence]: ...
 
-    def save_quote_transition(self, previous: Quote, updated: Quote) -> Quote: ...
+    def save_quote_transition(
+        self,
+        previous: Quote,
+        updated: Quote,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote: ...
 
     def create_payment(
         self,
@@ -41,8 +51,43 @@ class FinanceRepositoryPort(Protocol):
     ) -> PaymentAttempt: ...
 
     def confirm_payment(
-        self, payment_id: UUID, provider_reference: str
+        self,
+        payment_id: UUID,
+        provider_reference: str,
+        *,
+        correlation_id: UUID | None = None,
     ) -> PaymentAttempt: ...
+
+    def save_outbox_record(self, record: OutboxRecord) -> OutboxRecord: ...
+
+    def get_outbox_record(self, message_id: UUID) -> OutboxRecord | None: ...
+
+    def claim_outbox_records(
+        self,
+        *,
+        worker_id: str,
+        batch_size: int,
+        lease_duration: timedelta,
+        now: datetime | None = None,
+    ) -> list[OutboxRecord]: ...
+
+    def mark_outbox_published(
+        self,
+        *,
+        message_id: UUID,
+        claim_id: UUID,
+        published_at: datetime | None = None,
+    ) -> OutboxRecord: ...
+
+    def mark_outbox_failed(
+        self,
+        *,
+        message_id: UUID,
+        claim_id: UUID,
+        error: str,
+        next_attempt_at: datetime,
+        failed_at: datetime | None = None,
+    ) -> OutboxRecord: ...
 
     def get_financial_status(
         self, order_id: UUID

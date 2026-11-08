@@ -1,19 +1,24 @@
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from threading import Barrier
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from boto3.dynamodb.conditions import Key
+from jsonschema import Draft202012Validator, FormatChecker
 
+import app.infrastructure.dynamodb as dynamodb_module
 from app.config import Settings
 from app.domain.exceptions import FinanceConflictError, IdempotencyConflictError
 from app.domain.models import (
     CustomerContact,
     OutboxRecord,
+    OutboxStatus,
     PaymentStatus,
     Quote,
     QuoteCommunicationChannel,
@@ -120,6 +125,45 @@ def get_guard(repository, quote) -> dict:
         Key={"PK": f"ORDER#{quote.order_id}", "SK": "PAYMENT_GUARD"},
         ConsistentRead=True,
     )["Item"]
+
+
+def make_outbox_record(*, occurred_at: datetime | None = None) -> OutboxRecord:
+    now = occurred_at or datetime.now(UTC)
+    return OutboxRecord(
+        message_id=uuid4(),
+        event_type="QuoteApproved.v1",
+        event_version=1,
+        aggregate_id=uuid4(),
+        payload={"quote_id": str(uuid4()), "version": 1},
+        correlation_id=uuid4(),
+        operation_id=uuid4(),
+        occurred_at=now,
+        next_attempt_at=now,
+    )
+
+
+def pending_outbox(repository) -> list[OutboxRecord]:
+    items = repository.table.query(
+        IndexName="GSI2",
+        KeyConditionExpression=Key("GSI2PK").eq("OUTBOX#PENDING"),
+    )["Items"]
+    records = [repository.get_outbox_record(UUID(item["message_id"])) for item in items]
+    assert all(record is not None for record in records)
+    return records
+
+
+def outbox_envelope(record: OutboxRecord) -> dict:
+    return {
+        "message_id": str(record.message_id),
+        "message_type": record.event_type.rsplit(".v", 1)[0],
+        "message_version": record.event_version,
+        "occurred_at": record.occurred_at.isoformat(),
+        "correlation_id": str(record.correlation_id),
+        "causation_id": str(record.causation_id) if record.causation_id else None,
+        "operation_id": str(record.operation_id),
+        "saga_id": None,
+        "payload": record.payload,
+    }
 
 
 def test_bootstrap_is_idempotent_and_tables_are_isolated() -> None:
@@ -504,13 +548,7 @@ def test_concurrent_status_updates_preserve_terminal_state_and_guard(repository)
 
 
 def test_outbox_structure_is_persisted_and_indexed_without_publisher(repository) -> None:
-    record = OutboxRecord(
-        message_id=uuid4(),
-        event_type="QuoteApproved.v1",
-        aggregate_id=uuid4(),
-        payload={"quote_id": str(uuid4()), "version": 1},
-        next_attempt_at=datetime.now(UTC),
-    )
+    record = make_outbox_record()
     repository.save_outbox_record(record)
 
     stored = repository.get_outbox_record(record.message_id)
@@ -525,3 +563,237 @@ def test_outbox_structure_is_persisted_and_indexed_without_publisher(repository)
     assert indexed[0]["GSI2SK"].endswith(f"#{record.message_id}")
     with pytest.raises(FinanceConflictError):
         repository.save_outbox_record(record)
+
+
+def test_financial_transitions_persist_versioned_events_atomically(repository) -> None:
+    schema = json.loads(
+        Path("contracts/messages/financial-events.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    quote = repository.create_quote(make_quote())
+    communicated = repository.record_quote_communication(
+        quote,
+        make_evidences(quote),
+        correlation_id=uuid4(),
+    )
+    approved = repository.save_quote_transition(
+        communicated,
+        communicated.aprovar(),
+        correlation_id=uuid4(),
+    )
+    payment = create_payment(repository, approved)
+    repository.confirm_payment(
+        payment.payment_id,
+        "financial-events-ref",
+        correlation_id=uuid4(),
+    )
+
+    rejected_quote = repository.create_quote(make_quote())
+    rejected_communicated = repository.record_quote_communication(
+        rejected_quote,
+        make_evidences(rejected_quote),
+        correlation_id=uuid4(),
+    )
+    repository.save_quote_transition(
+        rejected_communicated,
+        rejected_communicated.recusar("cliente recusou"),
+        correlation_id=uuid4(),
+    )
+
+    records = pending_outbox(repository)
+    assert {record.event_type for record in records} == {
+        "QuoteCommunicated.v1",
+        "QuoteApproved.v1",
+        "QuoteRejected.v1",
+        "PaymentConfirmed.v1",
+    }
+    assert len(records) == 5
+    for record in records:
+        validator.validate(outbox_envelope(record))
+
+
+def test_outbox_conflict_rolls_back_quote_and_guard(
+    repository,
+    monkeypatch,
+) -> None:
+    quote = repository.create_quote(make_quote())
+    communicated = repository.record_quote_communication(
+        quote,
+        make_evidences(quote),
+        correlation_id=uuid4(),
+    )
+    duplicate = make_outbox_record()
+    repository.save_outbox_record(duplicate)
+    correlation_id = uuid4()
+    monkeypatch.setattr(dynamodb_module, "uuid4", lambda: duplicate.message_id)
+
+    with pytest.raises(FinanceConflictError, match="concorrentemente"):
+        repository.save_quote_transition(
+            communicated,
+            communicated.aprovar(),
+            correlation_id=correlation_id,
+        )
+
+    stored = repository.get_quote(quote.quote_id)
+    guard = repository.table.get_item(
+        Key={"PK": f"ORDER#{quote.order_id}", "SK": "QUOTE_GUARD"},
+        ConsistentRead=True,
+    )["Item"]
+    assert stored.status == QuoteStatus.COMUNICADO
+    assert stored.version == communicated.version
+    assert guard["status"] == QuoteStatus.COMUNICADO
+    assert int(guard["version"]) == communicated.version
+
+
+def test_outbox_conflict_rolls_back_payment_guard_and_provider_lock(
+    repository,
+    monkeypatch,
+) -> None:
+    quote = repository.create_quote(make_quote())
+    communicated = repository.record_quote_communication(
+        quote,
+        make_evidences(quote),
+        correlation_id=uuid4(),
+    )
+    approved = repository.save_quote_transition(
+        communicated,
+        communicated.aprovar(),
+        correlation_id=uuid4(),
+    )
+    payment = create_payment(repository, approved)
+    duplicate = make_outbox_record()
+    repository.save_outbox_record(duplicate)
+    correlation_id = uuid4()
+    monkeypatch.setattr(dynamodb_module, "uuid4", lambda: duplicate.message_id)
+
+    with pytest.raises(FinanceConflictError, match="Conflito ao atualizar pagamento"):
+        repository.confirm_payment(
+            payment.payment_id,
+            "rollback-provider-ref",
+            correlation_id=correlation_id,
+        )
+
+    stored = repository.get_payment(payment.payment_id)
+    guard = get_guard(repository, approved)
+    provider_lock = repository.table.get_item(
+        Key={
+            "PK": "PROVIDER_REF#simulated#rollback-provider-ref",
+            "SK": "LOCK",
+        },
+        ConsistentRead=True,
+    )
+    assert stored.status == PaymentStatus.PENDING
+    assert stored.provider_reference is None
+    assert guard["status"] == PaymentStatus.PENDING
+    assert int(guard["version"]) == payment.version
+    assert "Item" not in provider_lock
+
+
+def test_outbox_claim_is_conditional_between_concurrent_workers(repository) -> None:
+    now = datetime.now(UTC)
+    records = [make_outbox_record(occurred_at=now) for _ in range(4)]
+    for record in records:
+        repository.save_outbox_record(record)
+    barrier = Barrier(2)
+
+    def claim(worker_id: str) -> list[OutboxRecord]:
+        worker = DynamoDBFinanceRepository(repository.table)
+        barrier.wait()
+        return worker.claim_outbox_records(
+            worker_id=worker_id,
+            batch_size=2,
+            lease_duration=timedelta(seconds=30),
+            now=now,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.map(claim, ("finance-a", "finance-b"))
+
+    first_ids = {record.message_id for record in first}
+    second_ids = {record.message_id for record in second}
+    assert len(first_ids) == len(second_ids) == 2
+    assert first_ids.isdisjoint(second_ids)
+    assert first_ids | second_ids == {record.message_id for record in records}
+
+
+def test_outbox_recovers_expired_claim_and_rejects_stale_worker(repository) -> None:
+    now = datetime.now(UTC)
+    record = make_outbox_record(occurred_at=now)
+    repository.save_outbox_record(record)
+    [old_claim] = repository.claim_outbox_records(
+        worker_id="finance-old",
+        batch_size=1,
+        lease_duration=timedelta(seconds=10),
+        now=now,
+    )
+
+    assert repository.claim_outbox_records(
+        worker_id="finance-early",
+        batch_size=1,
+        lease_duration=timedelta(seconds=10),
+        now=now + timedelta(seconds=9),
+    ) == []
+
+    recovered_at = now + timedelta(seconds=11)
+    [recovered] = repository.claim_outbox_records(
+        worker_id="finance-recovery",
+        batch_size=1,
+        lease_duration=timedelta(seconds=10),
+        now=recovered_at,
+    )
+    assert recovered.claim_id != old_claim.claim_id
+    assert recovered.attempt_count == 2
+    with pytest.raises(FinanceConflictError, match="Claim"):
+        repository.mark_outbox_published(
+            message_id=record.message_id,
+            claim_id=old_claim.claim_id,
+            published_at=recovered_at + timedelta(seconds=1),
+        )
+
+
+def test_outbox_failure_retry_and_publication_update_gsi2(repository) -> None:
+    now = datetime.now(UTC)
+    record = make_outbox_record(occurred_at=now)
+    repository.save_outbox_record(record)
+    [claim] = repository.claim_outbox_records(
+        worker_id="finance",
+        batch_size=1,
+        lease_duration=timedelta(seconds=30),
+        now=now,
+    )
+    retry_at = now + timedelta(minutes=1)
+    failed = repository.mark_outbox_failed(
+        message_id=record.message_id,
+        claim_id=claim.claim_id,
+        error="ElasticMQ indisponível",
+        failed_at=now + timedelta(seconds=1),
+        next_attempt_at=retry_at,
+    )
+    assert failed.last_error == "ElasticMQ indisponível"
+    assert repository.claim_outbox_records(
+        worker_id="finance-early",
+        batch_size=1,
+        lease_duration=timedelta(seconds=30),
+        now=retry_at - timedelta(microseconds=1),
+    ) == []
+
+    [retry_claim] = repository.claim_outbox_records(
+        worker_id="finance-retry",
+        batch_size=1,
+        lease_duration=timedelta(seconds=30),
+        now=retry_at,
+    )
+    published = repository.mark_outbox_published(
+        message_id=record.message_id,
+        claim_id=retry_claim.claim_id,
+        published_at=retry_at + timedelta(seconds=1),
+    )
+    assert published.status == OutboxStatus.PUBLISHED
+    assert published.attempt_count == 2
+    assert published.last_error == "ElasticMQ indisponível"
+    assert repository.table.query(
+        IndexName="GSI2",
+        KeyConditionExpression=Key("GSI2PK").eq("OUTBOX#PENDING"),
+    )["Items"] == []

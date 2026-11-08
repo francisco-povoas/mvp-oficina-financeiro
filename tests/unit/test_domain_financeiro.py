@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -6,6 +6,8 @@ import pytest
 
 from app.domain.models import (
     CustomerContact,
+    OutboxRecord,
+    OutboxStatus,
     PaymentAttempt,
     PaymentStatus,
     Quote,
@@ -160,3 +162,33 @@ def test_payment_requires_positive_amount_and_attempt() -> None:
             method="PIX",
             amount=Decimal("0"),
         )
+
+
+def test_outbox_requires_consistent_version_claim_and_status() -> None:
+    now = datetime.now(UTC)
+    base = {
+        "message_id": uuid4(),
+        "event_type": "QuoteApproved.v1",
+        "event_version": 1,
+        "aggregate_id": uuid4(),
+        "payload": {"quote_id": str(uuid4())},
+        "correlation_id": uuid4(),
+        "operation_id": uuid4(),
+        "occurred_at": now,
+        "next_attempt_at": now,
+    }
+    with pytest.raises(ValueError, match="tipo e a versão"):
+        OutboxRecord(**{**base, "event_type": "QuoteApproved.v2"})
+    with pytest.raises(ValueError, match="integralmente"):
+        OutboxRecord(**base, claim_id=uuid4())
+    with pytest.raises(ValueError, match="data de publicação"):
+        OutboxRecord(**base, status=OutboxStatus.PUBLISHED)
+
+    published_at = now + timedelta(seconds=1)
+    published = OutboxRecord(
+        **base,
+        status=OutboxStatus.PUBLISHED,
+        published_at=published_at,
+        attempt_count=1,
+    )
+    assert published.published_at == published_at
