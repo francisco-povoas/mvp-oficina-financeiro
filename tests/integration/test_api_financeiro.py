@@ -21,6 +21,7 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
     )
     order_id = str(uuid4())
     line_id = str(uuid4())
+    table = ensure_table(settings)
     try:
         with TestClient(create_app(settings)) as client:
             token = JWTProvider(
@@ -121,7 +122,7 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "CONFIRMED"
     finally:
-        ensure_table(settings).delete()
+        table.delete()
 
 
 def test_quote_and_communication_http_invariants() -> None:
@@ -130,6 +131,7 @@ def test_quote_and_communication_http_invariants() -> None:
         dynamodb_endpoint_url=os.environ["DYNAMODB_ENDPOINT_URL"],
         dynamodb_table=f"mvp-oficina-financeiro-api-rules-{uuid4().hex}",
     )
+    table = ensure_table(settings)
     try:
         with TestClient(create_app(settings)) as client:
             token = JWTProvider(
@@ -254,4 +256,4 @@ def test_quote_and_communication_http_invariants() -> None:
             )
             assert new_round.status_code == 409
     finally:
-        ensure_table(settings).delete()
+        table.delete()

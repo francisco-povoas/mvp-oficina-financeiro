@@ -4,9 +4,9 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api import v1
 from app.config import Settings
 from app.main import create_app
+from app.presentation.dependencies import get_finance_service
 from app.security.auth import RequireRoles
 from app.security.jwt import JWTProvider
 
@@ -49,7 +49,7 @@ def provider(settings: Settings) -> JWTProvider:
 @pytest.fixture
 def client(settings: Settings) -> Iterator[TestClient]:
     app = create_app(settings)
-    app.dependency_overrides[v1._service] = object
+    app.dependency_overrides[get_finance_service] = object
     with TestClient(app) as test_client:
         yield test_client
 

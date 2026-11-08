@@ -1,6 +1,7 @@
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+from app.application.ports import FinanceRepositoryPort, PaymentProviderPort
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
 from app.domain.models import (
     CustomerContact,
@@ -10,12 +11,16 @@ from app.domain.models import (
     QuoteLine,
     QuoteStatus,
 )
-from app.infrastructure.dynamodb import FinanceRepository
 
 
 class FinanceService:
-    def __init__(self, repository: FinanceRepository) -> None:
+    def __init__(
+        self,
+        repository: FinanceRepositoryPort,
+        payment_provider: PaymentProviderPort,
+    ) -> None:
         self.repository = repository
+        self.payment_provider = payment_provider
 
     def create_quote(
         self,
@@ -89,7 +94,12 @@ class FinanceService:
     def confirm_simulated_payment(
         self, payment_id: UUID, provider_reference: str
     ) -> PaymentAttempt:
-        return self.repository.confirm_payment(payment_id, provider_reference)
+        confirmation = self.payment_provider.confirm_payment(
+            payment_id, provider_reference
+        )
+        return self.repository.confirm_payment(
+            payment_id, confirmation.provider_reference
+        )
 
     def _get_quote(self, quote_id: UUID) -> Quote:
         quote = self.repository.get_quote(quote_id)

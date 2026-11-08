@@ -5,7 +5,7 @@ from app.main import create_app
 
 
 def test_health_identifies_financeiro_service() -> None:
-    app = create_app(Settings(environment="test"))
+    app = create_app(Settings(environment="test", dynamodb_table="test-table"))
 
     with TestClient(app) as client:
         response = client.get("/health")

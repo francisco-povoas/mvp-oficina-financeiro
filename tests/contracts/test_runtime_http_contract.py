@@ -29,7 +29,9 @@ def _assert_problem(response, status_code: int, correlation_id: str | None = Non
 
 
 def test_success_response_echoes_correlation_id() -> None:
-    with TestClient(create_app(Settings(environment="test"))) as client:
+    with TestClient(
+        create_app(Settings(environment="test", dynamodb_table="test-table"))
+    ) as client:
         response = client.get(
             "/health", headers={"X-Correlation-ID": CORRELATION_ID}
         )
@@ -39,7 +41,9 @@ def test_success_response_echoes_correlation_id() -> None:
 
 
 def test_authentication_authorization_validation_and_planned_responses() -> None:
-    settings = Settings(environment="test", jwt_secret_key=SECRET)
+    settings = Settings(
+        environment="test", jwt_secret_key=SECRET, dynamodb_table="test-table"
+    )
     provider = JWTProvider(
         settings.jwt_secret_key,
         settings.jwt_access_token_expire_minutes,

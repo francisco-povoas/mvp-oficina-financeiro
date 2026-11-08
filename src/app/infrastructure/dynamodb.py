@@ -340,7 +340,7 @@ def outbox_from_item(item: dict[str, Any]) -> OutboxRecord:
     )
 
 
-class FinanceRepository:
+class DynamoDBFinanceRepository:
     def __init__(self, table) -> None:
         self.table = table
         self.client = table.meta.client

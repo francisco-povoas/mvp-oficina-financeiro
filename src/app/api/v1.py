@@ -3,10 +3,9 @@ from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from app.application.services import FinanceService
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
 from app.domain.models import (
     CustomerContact,
@@ -16,7 +15,7 @@ from app.domain.models import (
     QuoteCommunicationEvidence,
     QuoteLine,
 )
-from app.infrastructure.dynamodb import FinanceRepository, ensure_table
+from app.presentation.dependencies import ServiceDep
 from app.security.auth import RequireRoles
 from app.security.roles import Role
 
@@ -83,14 +82,6 @@ class CreatePaymentRequest(BaseModel):
 
 class ConfirmPaymentRequest(BaseModel):
     provider_reference: str
-
-
-def _service(request: Request) -> FinanceService:
-    table = ensure_table(request.app.state.settings)
-    return FinanceService(FinanceRepository(table))
-
-
-ServiceDep = Annotated[FinanceService, Depends(_service)]
 
 
 def _line(value: QuoteLineRequest) -> QuoteLine:

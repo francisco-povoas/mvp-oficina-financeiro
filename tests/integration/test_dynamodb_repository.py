@@ -21,7 +21,7 @@ from app.domain.models import (
     QuoteLine,
     QuoteStatus,
 )
-from app.infrastructure.dynamodb import FinanceRepository, ensure_table
+from app.infrastructure.dynamodb import DynamoDBFinanceRepository, ensure_table
 
 pytestmark = pytest.mark.integration
 
@@ -42,7 +42,7 @@ def delete_table(table) -> None:
 @pytest.fixture
 def repository():
     table = ensure_table(make_settings())
-    yield FinanceRepository(table)
+    yield DynamoDBFinanceRepository(table)
     delete_table(table)
 
 
@@ -261,7 +261,7 @@ def test_concurrent_communications_commit_only_one_complete_round(repository) ->
     barrier = Barrier(2)
 
     def communicate(evidences):
-        worker = FinanceRepository(repository.table)
+        worker = DynamoDBFinanceRepository(repository.table)
         barrier.wait()
         try:
             return worker.record_quote_communication(quote, evidences)
@@ -429,7 +429,7 @@ def test_concurrent_payment_requests_create_only_one_active_attempt(repository) 
     barrier = Barrier(2)
 
     def request_payment(key):
-        worker_repository = FinanceRepository(repository.table)
+        worker_repository = DynamoDBFinanceRepository(repository.table)
         barrier.wait()
         try:
             return create_payment(worker_repository, quote, key)
@@ -456,7 +456,7 @@ def test_concurrent_same_idempotency_key_returns_the_same_payment(repository) ->
     barrier = Barrier(2)
 
     def request_payment(_):
-        worker_repository = FinanceRepository(repository.table)
+        worker_repository = DynamoDBFinanceRepository(repository.table)
         barrier.wait()
         return create_payment(worker_repository, quote, "same-concurrent-key")
 
@@ -479,7 +479,7 @@ def test_concurrent_status_updates_preserve_terminal_state_and_guard(repository)
     barrier = Barrier(2)
 
     def update(status):
-        worker_repository = FinanceRepository(repository.table)
+        worker_repository = DynamoDBFinanceRepository(repository.table)
         barrier.wait()
         try:
             return worker_repository.transition_payment_status(payment.payment_id, status)
