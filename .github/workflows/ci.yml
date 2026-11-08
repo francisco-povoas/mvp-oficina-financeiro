@@ -11,6 +11,23 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: test
+      LOG_LEVEL: WARNING
+      PYTHONPATH: src
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      DYNAMODB_ENDPOINT_URL: http://127.0.0.1:8000
+      DYNAMODB_TABLE: mvp-oficina-financeiro-ci
+      JWT_SECRET_KEY: chave-ficticia-exclusiva-para-ci
+      JWT_ALGORITHM: HS256
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.6.1
+        ports:
+          - 8000:8000
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,6 +36,17 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m ruff check src tests
-      - run: python -m pytest --cov=src/app --cov-report=term-missing
-      - run: docker build --target runtime -t mvp-oficina-financeiro:${{ github.sha }} .
+      - name: Wait for and bootstrap DynamoDB Local
+        run: python -m app.infrastructure.bootstrap
+      - name: Lint
+        run: python -m ruff check src tests
+      - name: Unit tests
+        run: python -m pytest tests/unit
+      - name: Contract tests
+        run: python -m pytest tests/contracts
+      - name: DynamoDB integration tests
+        run: python -m pytest tests/integration
+      - name: Full suite and coverage gate
+        run: python -m pytest --cov=src/app --cov-report=term-missing
+      - name: Build runtime image
+        run: docker build --target runtime -t mvp-oficina-financeiro:${{ github.sha }} .
