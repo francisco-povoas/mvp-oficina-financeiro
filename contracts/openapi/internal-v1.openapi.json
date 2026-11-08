@@ -2,15 +2,15 @@
   "openapi": "3.1.0",
   "info": {
     "title": "MVP Oficina Financeiro — API interna",
-    "version": "1.0.1",
-    "description": "Reconciliação financeira autoritativa. Implementação funcional planejada para a Etapa 2."
+    "version": "1.1.0",
+    "description": "Reconciliação financeira autoritativa implementada na frente REST da Etapa 2."
   },
   "servers": [{"url": "http://mvp-oficina-financeiro/internal/v1"}],
   "paths": {
     "/orders/{order_id}/financial-status": {
       "get": {
         "operationId": "getFinancialStatus",
-        "x-implementation-status": "planned-stage-2",
+        "x-implementation-status": "implemented-stage-2-rest",
         "x-required-scopes": ["finance:status:read"],
         "security": [{"serviceBearer": []}],
         "parameters": [
@@ -27,8 +27,7 @@
           "403": {"$ref": "#/components/responses/Forbidden"},
           "404": {"$ref": "#/components/responses/NotFound"},
           "422": {"$ref": "#/components/responses/ValidationError"},
-          "500": {"$ref": "#/components/responses/InternalError"},
-          "501": {"$ref": "#/components/responses/Planned"}
+          "500": {"$ref": "#/components/responses/InternalError"}
         }
       }
     }

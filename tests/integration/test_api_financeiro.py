@@ -1,16 +1,64 @@
 import os
 from datetime import UTC, datetime
-from uuid import uuid4
+from decimal import Decimal
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.application.ports import (
+    PaymentContext,
+    QuoteContext,
+    SnapshotLine,
+)
 from app.config import Settings
 from app.infrastructure.dynamodb import ensure_table
 from app.main import create_app
 from app.security.jwt import JWTProvider
 
 pytestmark = pytest.mark.integration
+
+
+class FakeOrdersContext:
+    def __init__(self, line_id: str, price: str) -> None:
+        self.line_id = line_id
+        self.price = price
+
+    def get_quote_context(self, order_id, correlation_id) -> QuoteContext:
+        return QuoteContext(
+            order_id=order_id,
+            order_version=2,
+            status="DIAGNOSTICO_CONCLUIDO",
+            email="cliente@example.com",
+            telefone="5511999999999",
+            services=(
+                SnapshotLine(
+                    reference_id=UUID(self.line_id),
+                    description="Revisão",
+                    quantity=1,
+                    unit_price=Decimal(self.price),
+                ),
+            ),
+            items=(),
+        )
+
+    def get_payment_context(
+        self,
+        *,
+        order_id,
+        quote_id,
+        quote_version,
+        approved_total,
+        correlation_id,
+    ) -> PaymentContext:
+        return PaymentContext(
+            order_id=order_id,
+            order_version=9,
+            status="FINALIZADA",
+            approved_quote_id=quote_id,
+            approved_quote_version=quote_version,
+            approved_total=approved_total,
+        )
 
 
 def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
@@ -23,7 +71,12 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
     line_id = str(uuid4())
     table = ensure_table(settings)
     try:
-        with TestClient(create_app(settings)) as client:
+        with TestClient(
+            create_app(
+                settings,
+                orders_context=FakeOrdersContext(line_id, "200.00"),
+            )
+        ) as client:
             token = JWTProvider(
                 settings.jwt_secret_key,
                 settings.jwt_access_token_expire_minutes,
@@ -121,6 +174,30 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
             )
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "CONFIRMED"
+
+            service_token = JWTProvider(
+                settings.jwt_secret_key,
+                settings.jwt_access_token_expire_minutes,
+                settings.jwt_algorithm,
+                settings.jwt_issuer,
+            ).create_service_token(
+                client_id="mvp-oficina-ordens",
+                audience=settings.service_name,
+                scopes={"finance:status:read"},
+                expire_minutes=5,
+            )["access_token"]
+            correlation_id = str(uuid4())
+            financial_status = client.get(
+                f"/internal/v1/orders/{order_id}/financial-status",
+                headers={
+                    "Authorization": f"Bearer {service_token}",
+                    "X-Correlation-ID": correlation_id,
+                },
+            )
+            assert financial_status.status_code == 200
+            assert financial_status.headers["X-Correlation-ID"] == correlation_id
+            assert financial_status.json()["quote"]["status"] == "APROVADO"
+            assert financial_status.json()["payment"]["status"] == "CONFIRMED"
     finally:
         table.delete()
 
@@ -133,7 +210,13 @@ def test_quote_and_communication_http_invariants() -> None:
     )
     table = ensure_table(settings)
     try:
-        with TestClient(create_app(settings)) as client:
+        line_id = str(uuid4())
+        with TestClient(
+            create_app(
+                settings,
+                orders_context=FakeOrdersContext(line_id, "150.00"),
+            )
+        ) as client:
             token = JWTProvider(
                 settings.jwt_secret_key,
                 settings.jwt_access_token_expire_minutes,
@@ -174,22 +257,6 @@ def test_quote_and_communication_http_invariants() -> None:
                         "telefone": "5511999999999",
                     },
                 }
-
-            no_service = quote_body()
-            no_service["services"] = []
-            assert client.post("/api/v1/quotes", json=no_service).status_code == 409
-
-            inactive_service = quote_body()
-            inactive_service["services"][0]["active"] = False
-            assert client.post("/api/v1/quotes", json=inactive_service).status_code == 409
-
-            missing_phone = quote_body()
-            missing_phone["customer_contact"].pop("telefone")
-            assert client.post("/api/v1/quotes", json=missing_phone).status_code == 422
-
-            invalid_state = quote_body()
-            invalid_state["order_status"] = "RECEBIDA"
-            assert client.post("/api/v1/quotes", json=invalid_state).status_code == 409
 
             created = client.post("/api/v1/quotes", json=quote_body())
             assert created.status_code == 201

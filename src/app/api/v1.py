@@ -3,17 +3,15 @@ from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
 from app.domain.models import (
-    CustomerContact,
     PaymentAttempt,
     Quote,
     QuoteCommunicationChannel,
     QuoteCommunicationEvidence,
-    QuoteLine,
 )
 from app.presentation.dependencies import ServiceDep
 from app.security.auth import RequireRoles
@@ -32,26 +30,8 @@ _ADMIN_ATENDENTE_MECANICO = Depends(
 )
 
 
-class QuoteLineRequest(BaseModel):
-    reference_id: UUID
-    description: str
-    quantity: int = Field(gt=0)
-    unit_price: Decimal = Field(ge=0)
-    active: bool = True
-
-
-class CustomerContactRequest(BaseModel):
-    email: str = Field(min_length=1)
-    telefone: str = Field(min_length=1)
-
-
 class CreateQuoteRequest(BaseModel):
     order_id: UUID
-    order_version: int = Field(gt=0)
-    order_status: str
-    services: list[QuoteLineRequest] = Field(default_factory=list)
-    items: list[QuoteLineRequest] = Field(default_factory=list)
-    customer_contact: CustomerContactRequest
 
 
 class CommunicationEvidenceRequest(BaseModel):
@@ -82,10 +62,6 @@ class CreatePaymentRequest(BaseModel):
 
 class ConfirmPaymentRequest(BaseModel):
     provider_reference: str
-
-
-def _line(value: QuoteLineRequest) -> QuoteLine:
-    return QuoteLine(**value.model_dump())
 
 
 def _quote_response(quote: Quote) -> dict:
@@ -164,15 +140,15 @@ def _payment_response(payment: PaymentAttempt) -> dict:
 
 
 @router.post("/quotes", status_code=201, dependencies=[_ADMIN_ATENDENTE])
-def create_quote(body: CreateQuoteRequest, service: ServiceDep) -> dict:
+def create_quote(
+    body: CreateQuoteRequest,
+    request: Request,
+    service: ServiceDep,
+) -> dict:
     try:
-        quote = service.create_quote(
+        quote = service.create_quote_from_order(
             order_id=body.order_id,
-            order_version=body.order_version,
-            order_status=body.order_status,
-            services=tuple(_line(line) for line in body.services),
-            items=tuple(_line(line) for line in body.items),
-            customer_contact=CustomerContact(**body.customer_contact.model_dump()),
+            correlation_id=str(request.state.correlation_id),
         )
         return _quote_response(quote)
     except (ValueError, FinanceConflictError) as exc:
@@ -242,16 +218,18 @@ def _transition(operation) -> dict:
 @router.post("/payments", status_code=201, dependencies=[_ADMIN_ATENDENTE])
 def create_payment(
     body: CreatePaymentRequest,
+    request: Request,
     service: ServiceDep,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> dict:
     try:
         return _payment_response(
-            service.create_payment(
+            service.create_payment_from_order(
                 quote_id=body.quote_id,
                 method=body.method,
                 amount=body.amount,
                 idempotency_key=idempotency_key,
+                correlation_id=str(request.state.correlation_id),
             )
         )
     except FinanceNotFoundError as exc:

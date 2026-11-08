@@ -961,3 +961,25 @@ class DynamoDBFinanceRepository:
             if last_key is None:
                 return items
             query["ExclusiveStartKey"] = last_key
+
+    def get_financial_status(
+        self, order_id: UUID
+    ) -> tuple[Quote | None, PaymentAttempt | None]:
+        history = self.list_order_history(order_id)
+        quotes = [
+            quote_from_item(item)
+            for item in history
+            if item.get("entity_type") == "QUOTE"
+        ]
+        payments = [
+            payment_from_item(item)
+            for item in history
+            if item.get("entity_type") == "PAYMENT"
+        ]
+        quote = max(quotes, key=lambda item: item.created_at, default=None)
+        payment = max(
+            payments,
+            key=lambda item: (item.attempt_number, item.created_at),
+            default=None,
+        )
+        return quote, payment

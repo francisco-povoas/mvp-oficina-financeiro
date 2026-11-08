@@ -12,7 +12,16 @@ CORRELATION_ID = str(uuid4())
 
 
 def _settings() -> Settings:
-    return Settings(environment="test", jwt_secret_key=SECRET)
+    return Settings(
+        environment="test",
+        jwt_secret_key=SECRET,
+        dynamodb_table="test-table",
+    )
+
+
+class FakeFinanceService:
+    def get_financial_status(self, order_id):
+        return None, None
 
 
 def _provider(settings: Settings) -> JWTProvider:
@@ -46,7 +55,7 @@ def test_internal_finance_endpoint_requires_exact_service_token() -> None:
     )["access_token"]
     path = f"/internal/v1/orders/{uuid4()}/financial-status"
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings, finance_service=FakeFinanceService())) as client:
         headers = {"X-Correlation-ID": CORRELATION_ID}
         assert client.get(path, headers=headers).status_code == 401
         assert client.get(
@@ -61,7 +70,7 @@ def test_internal_finance_endpoint_requires_exact_service_token() -> None:
         assert client.get(
             path,
             headers={**headers, "Authorization": f"Bearer {correct}"},
-        ).status_code == 501
+        ).status_code == 404
 
 
 def test_public_finance_endpoint_rejects_service_token_before_persistence() -> None:
@@ -73,7 +82,7 @@ def test_public_finance_endpoint_rejects_service_token_before_persistence() -> N
         expire_minutes=5,
     )["access_token"]
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings, finance_service=FakeFinanceService())) as client:
         response = client.post(
             "/api/v1/quotes",
             headers={"Authorization": f"Bearer {service}"},
