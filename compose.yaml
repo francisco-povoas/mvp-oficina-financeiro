@@ -1,0 +1,31 @@
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb"]
+    working_dir: /home/dynamodblocal
+    ports:
+      - "8004:8000"
+    volumes:
+      - financeiro_dynamodb:/home/dynamodblocal/data
+
+  api:
+    build:
+      context: .
+      target: runtime
+    environment:
+      ENVIRONMENT: dev
+      LOG_LEVEL: INFO
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
+      DYNAMODB_TABLE: mvp-oficina-financeiro-dev
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      JWT_SECRET_KEY: chave-local-nao-usar-em-producao
+      JWT_ALGORITHM: HS256
+    ports:
+      - "8003:8003"
+    depends_on:
+      - dynamodb
+
+volumes:
+  financeiro_dynamodb:
