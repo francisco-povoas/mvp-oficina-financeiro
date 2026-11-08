@@ -9,6 +9,13 @@ orçamentos, snapshots e histórico de tentativas de pagamento. Guards, idempot�
 referências externas, concorrência otimista e a estrutura persistente da Outbox são
 validados contra DynamoDB Local.
 
+A geração exige contexto da OS em `DIAGNOSTICO_CONCLUIDO`, ao menos um serviço
+ativo e snapshots com e-mail e telefone. A comunicação é um registro local de
+evidências: uma tentativa de WhatsApp e uma de e-mail por rodada. Somente uma rodada
+com as duas evidências bem-sucedidas promove o orçamento de `RASCUNHO` para
+`COMUNICADO`. O serviço não envia mensagens externas nesta etapa; o histórico pode ser
+consultado em `GET /api/v1/quotes/{quote_id}/communications`.
+
 ## Estrutura inicial
 
 - `src/app/`: aplicação FastAPI e camadas próprias de domínio e persistência;

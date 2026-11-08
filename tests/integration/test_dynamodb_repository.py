@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Barrier
@@ -9,7 +10,16 @@ from boto3.dynamodb.conditions import Key
 
 from app.config import Settings
 from app.domain.exceptions import FinanceConflictError, IdempotencyConflictError
-from app.domain.models import OutboxRecord, PaymentStatus, Quote, QuoteLine, QuoteStatus
+from app.domain.models import (
+    CustomerContact,
+    OutboxRecord,
+    PaymentStatus,
+    Quote,
+    QuoteCommunicationChannel,
+    QuoteCommunicationEvidence,
+    QuoteLine,
+    QuoteStatus,
+)
 from app.infrastructure.dynamodb import FinanceRepository, ensure_table
 
 pytestmark = pytest.mark.integration
@@ -40,6 +50,7 @@ def make_quote(*, order_id=None) -> Quote:
         quote_id=uuid4(),
         order_id=order_id or uuid4(),
         order_version=4,
+        order_status="DIAGNOSTICO_CONCLUIDO",
         services=(
             QuoteLine(
                 reference_id=uuid4(),
@@ -56,7 +67,39 @@ def make_quote(*, order_id=None) -> Quote:
                 unit_price=Decimal("25.00"),
             ),
         ),
-        customer_contact={"telefone": "5511999999999"},
+        customer_contact=CustomerContact(
+            email="cliente@example.com", telefone="5511999999999"
+        ),
+    )
+
+
+def make_evidences(
+    quote: Quote,
+    *,
+    communication_id=None,
+    success: bool = True,
+) -> tuple[QuoteCommunicationEvidence, ...]:
+    communication_id = communication_id or uuid4()
+    now = datetime.now(UTC)
+    return tuple(
+        QuoteCommunicationEvidence(
+            evidence_id=uuid4(),
+            communication_id=communication_id,
+            quote_id=quote.quote_id,
+            order_id=quote.order_id,
+            channel=channel,
+            destination=(
+                quote.customer_contact.email
+                if channel == QuoteCommunicationChannel.EMAIL
+                else quote.customer_contact.telefone
+            ),
+            success=success,
+            message="enviado" if success else "falha",
+            provider="mock-local",
+            external_reference=(f"ref-{channel.value}" if success else None),
+            sent_at=now,
+        )
+        for channel in QuoteCommunicationChannel
     )
 
 
@@ -139,6 +182,105 @@ def test_quote_snapshots_and_guards_are_persisted(repository) -> None:
         repository.create_quote(make_quote(order_id=quote.order_id))
 
 
+def test_quote_rejects_tampered_persisted_totals(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    repository.table.update_item(
+        Key={"PK": f"QUOTE#{quote.quote_id}", "SK": "META"},
+        UpdateExpression="SET total_items = :invalid",
+        ExpressionAttributeValues={":invalid": Decimal("999.00")},
+    )
+
+    with pytest.raises(FinanceConflictError, match="total_items inconsistente"):
+        repository.get_quote(quote.quote_id)
+
+
+def test_failed_and_successful_communication_rounds_are_auditable(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    failed_evidences = make_evidences(quote, success=False)
+
+    still_draft = repository.record_quote_communication(quote, failed_evidences)
+    assert still_draft.status == QuoteStatus.RASCUNHO
+    assert still_draft.version == 1
+    assert len(repository.list_quote_communications(quote.quote_id)) == 2
+
+    successful_evidences = make_evidences(quote)
+    communicated = repository.record_quote_communication(
+        still_draft, successful_evidences
+    )
+    history = repository.list_quote_communications(quote.quote_id)
+    guard = repository.table.get_item(
+        Key={"PK": f"ORDER#{quote.order_id}", "SK": "QUOTE_GUARD"},
+        ConsistentRead=True,
+    )["Item"]
+
+    assert communicated.status == QuoteStatus.COMUNICADO
+    assert communicated.communicated_at is not None
+    assert len(history) == 4
+    assert {evidence.channel for evidence in history} == set(QuoteCommunicationChannel)
+    assert [evidence.success for evidence in history].count(False) == 2
+    assert guard["status"] == QuoteStatus.COMUNICADO
+    assert int(guard["version"]) == 2
+
+
+def test_repeated_communication_is_idempotent_and_payload_is_immutable(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    evidences = make_evidences(quote)
+    first = repository.record_quote_communication(quote, evidences)
+    repeated = repository.record_quote_communication(quote, evidences)
+
+    assert repeated == first
+    assert len(repository.list_quote_communications(quote.quote_id)) == 2
+
+    changed = (
+        replace(evidences[0], message="payload divergente"),
+        evidences[1],
+    )
+    with pytest.raises(FinanceConflictError, match="evidência diferente"):
+        repository.record_quote_communication(quote, changed)
+
+
+def test_communication_requires_both_channels_and_snapshot_destinations(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    evidences = make_evidences(quote)
+
+    with pytest.raises(ValueError, match="uma evidência por canal"):
+        repository.record_quote_communication(quote, evidences[:1])
+    wrong_destination = (
+        replace(evidences[0], destination="outro@example.com"),
+        evidences[1],
+    )
+    with pytest.raises(ValueError, match="difere do contato"):
+        repository.record_quote_communication(quote, wrong_destination)
+    assert repository.list_quote_communications(quote.quote_id) == []
+
+
+def test_concurrent_communications_commit_only_one_complete_round(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    rounds = (make_evidences(quote), make_evidences(quote))
+    barrier = Barrier(2)
+
+    def communicate(evidences):
+        worker = FinanceRepository(repository.table)
+        barrier.wait()
+        try:
+            return worker.record_quote_communication(quote, evidences)
+        except FinanceConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(communicate, rounds))
+
+    successes = [result for result in results if not isinstance(result, Exception)]
+    conflicts = [result for result in results if isinstance(result, FinanceConflictError)]
+    history = repository.list_quote_communications(quote.quote_id)
+
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert successes[0].status == QuoteStatus.COMUNICADO
+    assert len(history) == 2
+    assert len({evidence.communication_id for evidence in history}) == 1
+
+
 @pytest.mark.parametrize(
     ("transition", "expected", "reason"),
     [
@@ -150,7 +292,7 @@ def test_quote_approval_and_rejection_update_document_and_guard(
     repository, transition, expected, reason
 ) -> None:
     quote = repository.create_quote(make_quote())
-    communicated = repository.save_quote_transition(quote, quote.comunicar())
+    communicated = repository.record_quote_communication(quote, make_evidences(quote))
     updated = (
         communicated.aprovar()
         if transition == "approve"
@@ -168,7 +310,7 @@ def test_quote_approval_and_rejection_update_document_and_guard(
     assert guard["status"] == expected
     assert int(guard["version"]) == stored.version
     with pytest.raises(FinanceConflictError):
-        repository.save_quote_transition(quote, quote.comunicar())
+        repository.record_quote_communication(quote, make_evidences(quote))
 
 
 def test_first_payment_and_same_key_are_idempotent(repository) -> None:

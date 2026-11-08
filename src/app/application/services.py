@@ -2,7 +2,14 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
-from app.domain.models import PaymentAttempt, Quote, QuoteLine, QuoteStatus
+from app.domain.models import (
+    CustomerContact,
+    PaymentAttempt,
+    Quote,
+    QuoteCommunicationEvidence,
+    QuoteLine,
+    QuoteStatus,
+)
 from app.infrastructure.dynamodb import FinanceRepository
 
 
@@ -15,24 +22,39 @@ class FinanceService:
         *,
         order_id: UUID,
         order_version: int,
+        order_status: str,
         services: tuple[QuoteLine, ...],
         items: tuple[QuoteLine, ...],
-        customer_contact: dict[str, str],
+        customer_contact: CustomerContact,
     ) -> Quote:
         return self.repository.create_quote(
             Quote(
                 quote_id=uuid4(),
                 order_id=order_id,
                 order_version=order_version,
-                services=services,
-                items=items,
+                order_status=order_status,
+                services=tuple(line for line in services if line.active),
+                items=tuple(line for line in items if line.active),
                 customer_contact=customer_contact,
             )
         )
 
-    def communicate_quote(self, quote_id: UUID) -> Quote:
+    def communicate_quote(
+        self,
+        quote_id: UUID,
+        evidences: tuple[QuoteCommunicationEvidence, ...],
+    ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.save_quote_transition(quote, quote.comunicar())
+        return self.repository.record_quote_communication(quote, evidences)
+
+    def get_quote(self, quote_id: UUID) -> Quote:
+        return self._get_quote(quote_id)
+
+    def list_quote_communications(
+        self, quote_id: UUID
+    ) -> list[QuoteCommunicationEvidence]:
+        self._get_quote(quote_id)
+        return self.repository.list_quote_communications(quote_id)
 
     def approve_quote(self, quote_id: UUID) -> Quote:
         quote = self._get_quote(quote_id)

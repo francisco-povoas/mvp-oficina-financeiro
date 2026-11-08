@@ -21,10 +21,13 @@ from app.domain.exceptions import (
 from app.domain.models import (
     ACTIVE_PAYMENT_STATUSES,
     RETRYABLE_PAYMENT_STATUSES,
+    CustomerContact,
     OutboxRecord,
     PaymentAttempt,
     PaymentStatus,
     Quote,
+    QuoteCommunicationChannel,
+    QuoteCommunicationEvidence,
     QuoteLine,
     QuoteStatus,
 )
@@ -124,6 +127,7 @@ def _line_to_item(line: QuoteLine) -> dict[str, Any]:
         "description": line.description,
         "quantity": line.quantity,
         "unit_price": line.unit_price,
+        "active": line.active,
     }
 
 
@@ -133,6 +137,7 @@ def _line_from_item(item: dict[str, Any]) -> QuoteLine:
         description=item["description"],
         quantity=int(item["quantity"]),
         unit_price=Decimal(item["unit_price"]),
+        active=bool(item.get("active", True)),
     )
 
 
@@ -144,13 +149,22 @@ def quote_to_item(quote: Quote) -> dict[str, Any]:
         "quote_id": str(quote.quote_id),
         "order_id": str(quote.order_id),
         "order_version": quote.order_version,
+        "order_status": quote.order_status,
         "status": quote.status.value,
         "version": quote.version,
         "services": [_line_to_item(line) for line in quote.services],
         "items": [_line_to_item(line) for line in quote.items],
-        "customer_contact": quote.customer_contact,
+        "customer_contact": {
+            "email": quote.customer_contact.email,
+            "telefone": quote.customer_contact.telefone,
+        },
+        "total_services": quote.total_services,
+        "total_items": quote.total_items,
         "total": quote.total,
         "rejection_reason": quote.rejection_reason or "",
+        "communicated_at": (
+            quote.communicated_at.isoformat() if quote.communicated_at else ""
+        ),
         "created_at": quote.created_at.isoformat(),
         "updated_at": quote.updated_at.isoformat(),
         "GSI1PK": f"ORDER#{quote.order_id}",
@@ -159,18 +173,94 @@ def quote_to_item(quote: Quote) -> dict[str, Any]:
 
 
 def quote_from_item(item: dict[str, Any]) -> Quote:
-    return Quote(
+    customer_contact = item.get("customer_contact", {})
+    quote = Quote(
         quote_id=UUID(item["quote_id"]),
         order_id=UUID(item["order_id"]),
         order_version=int(item["order_version"]),
+        order_status=item["order_status"],
         services=tuple(_line_from_item(line) for line in item.get("services", [])),
         items=tuple(_line_from_item(line) for line in item.get("items", [])),
-        customer_contact=dict(item.get("customer_contact", {})),
+        customer_contact=CustomerContact(
+            email=customer_contact.get("email", ""),
+            telefone=customer_contact.get("telefone", ""),
+        ),
         status=QuoteStatus(item["status"]),
         version=int(item["version"]),
         rejection_reason=item.get("rejection_reason") or None,
+        communicated_at=(
+            datetime.fromisoformat(item["communicated_at"])
+            if item.get("communicated_at")
+            else None
+        ),
         created_at=__import__("datetime").datetime.fromisoformat(item["created_at"]),
         updated_at=__import__("datetime").datetime.fromisoformat(item["updated_at"]),
+    )
+    expected_totals = {
+        "total_services": quote.total_services,
+        "total_items": quote.total_items,
+        "total": quote.total,
+    }
+    for attribute, expected in expected_totals.items():
+        if Decimal(item[attribute]) != expected:
+            raise FinanceConflictError(
+                f"Documento de orçamento possui {attribute} inconsistente"
+            )
+    return quote
+
+
+def communication_to_item(evidence: QuoteCommunicationEvidence) -> dict[str, Any]:
+    return {
+        "PK": f"QUOTE#{evidence.quote_id}",
+        "SK": f"COMMUNICATION#{evidence.communication_id}#{evidence.channel.value}",
+        "entity_type": "QUOTE_COMMUNICATION",
+        "evidence_id": str(evidence.evidence_id),
+        "communication_id": str(evidence.communication_id),
+        "quote_id": str(evidence.quote_id),
+        "order_id": str(evidence.order_id),
+        "channel": evidence.channel.value,
+        "destination": evidence.destination,
+        "success": evidence.success,
+        "message": evidence.message,
+        "provider": evidence.provider,
+        "external_reference": evidence.external_reference or "",
+        "sent_at": evidence.sent_at.isoformat(),
+        "recorded_at": evidence.recorded_at.isoformat(),
+        "GSI1PK": f"ORDER#{evidence.order_id}",
+        "GSI1SK": (
+            f"COMMUNICATION#{evidence.sent_at.isoformat()}#{evidence.evidence_id}"
+        ),
+    }
+
+
+def _communication_key(evidence: QuoteCommunicationEvidence) -> dict[str, str]:
+    return {
+        "PK": f"QUOTE#{evidence.quote_id}",
+        "SK": f"COMMUNICATION#{evidence.communication_id}#{evidence.channel.value}",
+    }
+
+
+def _communication_matches(
+    stored: QuoteCommunicationEvidence,
+    expected: QuoteCommunicationEvidence,
+) -> bool:
+    return replace(stored, recorded_at=expected.recorded_at) == expected
+
+
+def communication_from_item(item: dict[str, Any]) -> QuoteCommunicationEvidence:
+    return QuoteCommunicationEvidence(
+        evidence_id=UUID(item["evidence_id"]),
+        communication_id=UUID(item["communication_id"]),
+        quote_id=UUID(item["quote_id"]),
+        order_id=UUID(item["order_id"]),
+        channel=QuoteCommunicationChannel(item["channel"]),
+        destination=item["destination"],
+        success=bool(item["success"]),
+        message=item["message"],
+        provider=item["provider"],
+        external_reference=item.get("external_reference") or None,
+        sent_at=datetime.fromisoformat(item["sent_at"]),
+        recorded_at=datetime.fromisoformat(item["recorded_at"]),
     )
 
 
@@ -297,6 +387,172 @@ class FinanceRepository:
         item = response.get("Item")
         return quote_from_item(item) if item else None
 
+    def list_quote_communications(
+        self, quote_id: UUID
+    ) -> list[QuoteCommunicationEvidence]:
+        items: list[dict[str, Any]] = []
+        query: dict[str, Any] = {
+            "KeyConditionExpression": (
+                Key("PK").eq(f"QUOTE#{quote_id}")
+                & Key("SK").begins_with("COMMUNICATION#")
+            ),
+            "ConsistentRead": True,
+        }
+        while True:
+            response = self.table.query(**query)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if last_key is None:
+                break
+            query["ExclusiveStartKey"] = last_key
+        evidences = [communication_from_item(item) for item in items]
+        return sorted(evidences, key=lambda evidence: (evidence.sent_at, evidence.evidence_id))
+
+    def _existing_communication(
+        self, evidences: tuple[QuoteCommunicationEvidence, ...]
+    ) -> Quote | None:
+        stored_items = [
+            self.table.get_item(Key=_communication_key(evidence), ConsistentRead=True).get(
+                "Item"
+            )
+            for evidence in evidences
+        ]
+        if not any(stored_items):
+            return None
+        if not all(stored_items):
+            raise FinanceConflictError("Comunicação idempotente está incompleta")
+        stored = [communication_from_item(item) for item in stored_items]
+        if not all(
+            _communication_matches(current, expected)
+            for current, expected in zip(stored, evidences, strict=True)
+        ):
+            raise FinanceConflictError(
+                "Identificador de comunicação reutilizado com evidência diferente"
+            )
+        quote = self.get_quote(evidences[0].quote_id)
+        if quote is None:
+            raise FinanceNotFoundError("Orçamento não encontrado")
+        return quote
+
+    def record_quote_communication(
+        self,
+        quote: Quote,
+        evidences: tuple[QuoteCommunicationEvidence, ...],
+    ) -> Quote:
+        quote.validate_communication_evidences(evidences)
+        existing = self._existing_communication(evidences)
+        if existing is not None:
+            return existing
+        if quote.status != QuoteStatus.RASCUNHO:
+            raise FinanceConflictError("Somente orçamento em rascunho pode ser comunicado")
+
+        successful = all(evidence.success for evidence in evidences)
+        updated = quote.comunicar(evidences) if successful else quote
+        transaction: list[dict[str, Any]] = [
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": communication_to_item(evidence),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            }
+            for evidence in evidences
+        ]
+        quote_condition = "#status = :old_status AND #version = :old_version"
+        names = {"#status": "status", "#version": "version"}
+        values = {
+            ":old_status": quote.status.value,
+            ":old_version": quote.version,
+        }
+        guard_key = {"PK": f"ORDER#{quote.order_id}", "SK": "QUOTE_GUARD"}
+        if successful:
+            transition_values = {
+                **values,
+                ":new_status": updated.status.value,
+                ":new_version": updated.version,
+            }
+            transaction.extend(
+                [
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {"PK": f"QUOTE#{quote.quote_id}", "SK": "META"},
+                            "UpdateExpression": (
+                                "SET #status = :new_status, #version = :new_version, "
+                                "updated_at = :updated_at, communicated_at = :communicated_at"
+                            ),
+                            "ConditionExpression": quote_condition,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": {
+                                **transition_values,
+                                ":updated_at": updated.updated_at.isoformat(),
+                                ":communicated_at": updated.communicated_at.isoformat(),
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": guard_key,
+                            "UpdateExpression": (
+                                "SET #status = :new_status, #version = :new_version"
+                            ),
+                            "ConditionExpression": (
+                                "quote_id = :quote_id AND " + quote_condition
+                            ),
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": {
+                                **transition_values,
+                                ":quote_id": str(quote.quote_id),
+                            },
+                        }
+                    },
+                ]
+            )
+        else:
+            transaction.extend(
+                [
+                    {
+                        "ConditionCheck": {
+                            "TableName": self.table.name,
+                            "Key": {"PK": f"QUOTE#{quote.quote_id}", "SK": "META"},
+                            "ConditionExpression": quote_condition,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                    {
+                        "ConditionCheck": {
+                            "TableName": self.table.name,
+                            "Key": guard_key,
+                            "ConditionExpression": (
+                                "quote_id = :quote_id AND " + quote_condition
+                            ),
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": {
+                                **values,
+                                ":quote_id": str(quote.quote_id),
+                            },
+                        }
+                    },
+                ]
+            )
+        try:
+            self.client.transact_write_items(TransactItems=transaction)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "TransactionCanceledException":
+                concurrent = self._existing_communication(evidences)
+                if concurrent is not None:
+                    return concurrent
+                raise FinanceConflictError(
+                    "Conflito concorrente ao registrar comunicação"
+                ) from exc
+            raise
+        stored = self.get_quote(quote.quote_id)
+        if stored is None:
+            raise FinanceNotFoundError("Orçamento desapareceu após comunicação")
+        return stored
+
     def save_quote_transition(self, previous: Quote, updated: Quote) -> Quote:
         try:
             self.client.transact_write_items(
@@ -307,7 +563,8 @@ class FinanceRepository:
                             "Key": {"PK": f"QUOTE#{previous.quote_id}", "SK": "META"},
                             "UpdateExpression": (
                                 "SET #status = :new_status, #version = :new_version, "
-                                "updated_at = :updated_at, rejection_reason = :reason"
+                                "updated_at = :updated_at, rejection_reason = :reason, "
+                                "communicated_at = :communicated_at"
                             ),
                             "ConditionExpression": (
                                 "#status = :old_status AND #version = :old_version"
@@ -321,6 +578,11 @@ class FinanceRepository:
                                 ":new_version": updated.version,
                                 ":updated_at": updated.updated_at.isoformat(),
                                 ":reason": updated.rejection_reason or "",
+                                ":communicated_at": (
+                                    updated.communicated_at.isoformat()
+                                    if updated.communicated_at
+                                    else ""
+                                ),
                                 ":old_status": previous.status.value,
                                 ":old_version": previous.version,
                             },
@@ -425,6 +687,12 @@ class FinanceRepository:
         if guard:
             guard_status = PaymentStatus(guard["status"])
             if guard_status in ACTIVE_PAYMENT_STATUSES or guard_status == PaymentStatus.CONFIRMED:
+                concurrent_payment = self._get_idempotent_payment(
+                    idem_key=idem_key,
+                    request_hash=request_hash,
+                )
+                if concurrent_payment is not None:
+                    return concurrent_payment
                 raise FinanceConflictError("A ordem já possui pagamento ativo ou confirmado")
             if guard_status not in RETRYABLE_PAYMENT_STATUSES:
                 raise FinanceConflictError("O estado atual não permite nova tentativa")
