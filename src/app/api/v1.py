@@ -17,12 +17,19 @@ from app.domain.models import (
     QuoteLine,
 )
 from app.infrastructure.dynamodb import FinanceRepository, ensure_table
-from app.security.auth import require_user
+from app.security.auth import RequireRoles
+from app.security.roles import Role
 
 router = APIRouter(
     prefix="/api/v1",
     tags=["Financeiro"],
-    dependencies=[Depends(require_user)],
+)
+
+# Operações que alteram estado financeiro preservam a política do monólito.
+_ADMIN_ATENDENTE = Depends(RequireRoles(Role.ADMINISTRADOR, Role.ATENDENTE))
+# Consultas auditáveis preservam a leitura que o monólito também concedia ao mecânico.
+_ADMIN_ATENDENTE_MECANICO = Depends(
+    RequireRoles(Role.ADMINISTRADOR, Role.ATENDENTE, Role.MECANICO)
 )
 
 
@@ -165,7 +172,7 @@ def _payment_response(payment: PaymentAttempt) -> dict:
     }
 
 
-@router.post("/quotes", status_code=201)
+@router.post("/quotes", status_code=201, dependencies=[_ADMIN_ATENDENTE])
 def create_quote(body: CreateQuoteRequest, service: ServiceDep) -> dict:
     try:
         quote = service.create_quote(
@@ -181,12 +188,12 @@ def create_quote(body: CreateQuoteRequest, service: ServiceDep) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/quotes/{quote_id}")
+@router.get("/quotes/{quote_id}", dependencies=[_ADMIN_ATENDENTE_MECANICO])
 def get_quote(quote_id: UUID, service: ServiceDep) -> dict:
     return _transition(lambda: service.get_quote(quote_id))
 
 
-@router.post("/quotes/{quote_id}/communicate")
+@router.post("/quotes/{quote_id}/communicate", dependencies=[_ADMIN_ATENDENTE])
 def communicate_quote(
     quote_id: UUID,
     body: CommunicateQuoteRequest,
@@ -208,7 +215,10 @@ def communicate_quote(
     return _transition(operation)
 
 
-@router.get("/quotes/{quote_id}/communications")
+@router.get(
+    "/quotes/{quote_id}/communications",
+    dependencies=[_ADMIN_ATENDENTE_MECANICO],
+)
 def list_quote_communications(quote_id: UUID, service: ServiceDep) -> list[dict]:
     try:
         return [
@@ -219,12 +229,12 @@ def list_quote_communications(quote_id: UUID, service: ServiceDep) -> list[dict]
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/quotes/{quote_id}/approve")
+@router.post("/quotes/{quote_id}/approve", dependencies=[_ADMIN_ATENDENTE])
 def approve_quote(quote_id: UUID, service: ServiceDep) -> dict:
     return _transition(lambda: service.approve_quote(quote_id))
 
 
-@router.post("/quotes/{quote_id}/reject")
+@router.post("/quotes/{quote_id}/reject", dependencies=[_ADMIN_ATENDENTE])
 def reject_quote(quote_id: UUID, body: RejectQuoteRequest, service: ServiceDep) -> dict:
     return _transition(lambda: service.reject_quote(quote_id, body.reason))
 
@@ -238,7 +248,7 @@ def _transition(operation) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/payments", status_code=201)
+@router.post("/payments", status_code=201, dependencies=[_ADMIN_ATENDENTE])
 def create_payment(
     body: CreatePaymentRequest,
     service: ServiceDep,
@@ -259,7 +269,10 @@ def create_payment(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/payments/{payment_id}/simulate-confirm")
+@router.post(
+    "/payments/{payment_id}/simulate-confirm",
+    dependencies=[_ADMIN_ATENDENTE],
+)
 def confirm_payment(
     payment_id: UUID, body: ConfirmPaymentRequest, service: ServiceDep
 ) -> dict:

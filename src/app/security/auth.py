@@ -7,9 +7,16 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.security.jwt import InsufficientScope, InvalidToken, JWTProvider
+from app.security.roles import Role
 
-bearer = HTTPBearer(auto_error=True)
-Credential = Annotated[HTTPAuthorizationCredentials, Depends(bearer)]
+bearer = HTTPBearer(auto_error=False)
+Credential = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]
+
+_credentials_exception = HTTPException(
+    status_code=401,
+    detail="Token inválido, expirado ou incompatível",
+    headers={"WWW-Authenticate": "Bearer"},
+)
 
 
 @dataclass(frozen=True)
@@ -42,18 +49,36 @@ async def require_user(
     credential: Credential,
     provider: Provider,
 ) -> UserPrincipal:
+    if credential is None:
+        raise _credentials_exception
     try:
         user_id, roles = provider.get_sub(
             credential.credentials,
             audience=request.app.state.settings.jwt_user_audience,
         )
     except InvalidToken as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Token de usuário inválido, expirado ou incompatível",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        raise _credentials_exception from exc
     return UserPrincipal(user_id=user_id, roles=frozenset(roles))
+
+
+class RequireRoles:
+    """Autoriza somente perfis locais conhecidos e explicitamente permitidos."""
+
+    def __init__(self, *roles: Role) -> None:
+        if not roles:
+            raise ValueError("Política pública exige ao menos um perfil")
+        self.roles = frozenset(role.value for role in roles)
+
+    async def __call__(
+        self,
+        principal: Annotated[UserPrincipal, Depends(require_user)],
+    ) -> UserPrincipal:
+        known_roles = {role.value for role in Role}
+        if not principal.roles or not principal.roles.issubset(known_roles):
+            raise HTTPException(status_code=403, detail="Perfil de usuário não reconhecido")
+        if self.roles.isdisjoint(principal.roles):
+            raise HTTPException(status_code=403, detail="Permissão insuficiente")
+        return principal
 
 
 class RequireServiceScopes:
@@ -68,6 +93,8 @@ class RequireServiceScopes:
         credential: Credential,
         provider: Provider,
     ) -> ServicePrincipal:
+        if credential is None:
+            raise _credentials_exception
         try:
             client_id, granted = provider.get_service(
                 credential.credentials,
@@ -80,10 +107,6 @@ class RequireServiceScopes:
                 detail="Escopo de serviço insuficiente",
             ) from exc
         except InvalidToken as exc:
-            raise HTTPException(
-                status_code=401,
-                detail="Token de serviço inválido, expirado ou incompatível",
-                headers={"WWW-Authenticate": "Bearer"},
-            ) from exc
+            raise _credentials_exception from exc
         return ServicePrincipal(client_id=client_id, scopes=frozenset(granted))
 
