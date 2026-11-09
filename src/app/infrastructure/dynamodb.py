@@ -1132,6 +1132,7 @@ class DynamoDBFinanceRepository:
         worker_id: str,
         batch_size: int,
         lease_duration: timedelta,
+        max_attempts: int | None = None,
         now: datetime | None = None,
     ) -> list[OutboxRecord]:
         if not worker_id.strip():
@@ -1140,6 +1141,8 @@ class DynamoDBFinanceRepository:
             raise ValueError("batch_size deve ser positivo")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration deve ser positivo")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("max_attempts deve ser positivo")
         claimed_at = now or datetime.now(UTC)
         if claimed_at.tzinfo is None or claimed_at.utcoffset() is None:
             raise ValueError("now deve possuir fuso horário")
@@ -1158,6 +1161,26 @@ class DynamoDBFinanceRepository:
             response = self.table.query(**query)
             for candidate in response.get("Items", []):
                 claim_id = uuid4()
+                condition = (
+                    "#status=:pending AND #version=:version "
+                    "AND next_attempt_at<=:now AND "
+                    "(attribute_not_exists(claim_expires_at) "
+                    "OR claim_expires_at<=:now)"
+                )
+                expression_values = {
+                    ":claim_id": str(claim_id),
+                    ":worker": worker_id,
+                    ":claimed_at": claimed_at.isoformat(),
+                    ":expires_at": claim_expires_at.isoformat(),
+                    ":one": 1,
+                    ":updated": claimed_at.isoformat(),
+                    ":pending": OutboxStatus.PENDING.value,
+                    ":version": candidate["version"],
+                    ":now": claimed_at.isoformat(),
+                }
+                if max_attempts is not None:
+                    condition += " AND attempt_count<:max_attempts"
+                    expression_values[":max_attempts"] = max_attempts
                 try:
                     updated = self.table.update_item(
                         Key={"PK": candidate["PK"], "SK": candidate["SK"]},
@@ -1167,27 +1190,12 @@ class DynamoDBFinanceRepository:
                             "attempt_count=attempt_count+:one, #version=#version+:one, "
                             "updated_at=:updated"
                         ),
-                        ConditionExpression=(
-                            "#status=:pending AND #version=:version "
-                            "AND next_attempt_at<=:now AND "
-                            "(attribute_not_exists(claim_expires_at) "
-                            "OR claim_expires_at<=:now)"
-                        ),
+                        ConditionExpression=condition,
                         ExpressionAttributeNames={
                             "#status": "status",
                             "#version": "version",
                         },
-                        ExpressionAttributeValues={
-                            ":claim_id": str(claim_id),
-                            ":worker": worker_id,
-                            ":claimed_at": claimed_at.isoformat(),
-                            ":expires_at": claim_expires_at.isoformat(),
-                            ":one": 1,
-                            ":updated": claimed_at.isoformat(),
-                            ":pending": OutboxStatus.PENDING.value,
-                            ":version": candidate["version"],
-                            ":now": claimed_at.isoformat(),
-                        },
+                        ExpressionAttributeValues=expression_values,
                         ReturnValues="ALL_NEW",
                     )["Attributes"]
                 except ClientError as exc:

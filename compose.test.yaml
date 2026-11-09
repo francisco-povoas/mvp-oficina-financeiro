@@ -4,6 +4,16 @@ services:
     command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
     working_dir: /home/dynamodblocal
 
+  elasticmq-test:
+    image: softwaremill/elasticmq-native:1.7.1
+    volumes:
+      - ./tests/integration/elasticmq.conf:/opt/elasticmq.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9324/?Action=ListQueues"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
   tests:
     build:
       context: .
@@ -18,6 +28,11 @@ services:
       AWS_SECRET_ACCESS_KEY: testing
       JWT_SECRET_KEY: chave-ficticia-exclusiva-para-testes
       JWT_ALGORITHM: HS256
+      SQS_ENDPOINT_URL: http://elasticmq-test:9324
+      SQS_FINANCEIRO_TO_ORDENS_URL: http://elasticmq-test:9324/000000000000/mvp-oficina-financeiro-to-ordens-local.fifo
     command: pytest --cov=src/app --cov-report=term-missing --cov-report=xml:coverage.xml
     depends_on:
-      - dynamodb-test
+      dynamodb-test:
+        condition: service_started
+      elasticmq-test:
+        condition: service_healthy

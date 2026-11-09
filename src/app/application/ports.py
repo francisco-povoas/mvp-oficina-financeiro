@@ -68,6 +68,7 @@ class FinanceRepositoryPort(Protocol):
         worker_id: str,
         batch_size: int,
         lease_duration: timedelta,
+        max_attempts: int | None = None,
         now: datetime | None = None,
     ) -> list[OutboxRecord]: ...
 

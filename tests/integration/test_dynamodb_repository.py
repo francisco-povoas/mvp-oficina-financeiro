@@ -797,3 +797,36 @@ def test_outbox_failure_retry_and_publication_update_gsi2(repository) -> None:
         IndexName="GSI2",
         KeyConditionExpression=Key("GSI2PK").eq("OUTBOX#PENDING"),
     )["Items"] == []
+
+
+def test_outbox_claim_respects_max_attempts_conditionally(repository) -> None:
+    now = datetime.now(UTC)
+    record = make_outbox_record(occurred_at=now)
+    repository.save_outbox_record(record)
+    [claim] = repository.claim_outbox_records(
+        worker_id="finance-last-attempt",
+        batch_size=1,
+        lease_duration=timedelta(seconds=30),
+        max_attempts=1,
+        now=now,
+    )
+    repository.mark_outbox_failed(
+        message_id=record.message_id,
+        claim_id=claim.claim_id,
+        error="falha final",
+        failed_at=now + timedelta(seconds=1),
+        next_attempt_at=now + timedelta(seconds=1),
+    )
+
+    assert repository.claim_outbox_records(
+        worker_id="finance-exhausted",
+        batch_size=1,
+        lease_duration=timedelta(seconds=30),
+        max_attempts=1,
+        now=now + timedelta(seconds=2),
+    ) == []
+    exhausted = repository.get_outbox_record(record.message_id)
+    assert exhausted is not None
+    assert exhausted.status == OutboxStatus.PENDING
+    assert exhausted.attempt_count == 1
+    assert exhausted.last_error == "falha final"

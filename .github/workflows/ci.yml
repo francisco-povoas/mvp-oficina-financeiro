@@ -23,11 +23,17 @@ jobs:
       DYNAMODB_TABLE: mvp-oficina-financeiro-ci
       JWT_SECRET_KEY: chave-ficticia-exclusiva-para-ci
       JWT_ALGORITHM: HS256
+      SQS_ENDPOINT_URL: http://127.0.0.1:9324
+      SQS_FINANCEIRO_TO_ORDENS_URL: http://127.0.0.1:9324/000000000000/mvp-oficina-financeiro-to-ordens-local.fifo
     services:
       dynamodb:
         image: amazon/dynamodb-local:2.6.1
         ports:
           - 8000:8000
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.7.1
+        ports:
+          - 9324:9324
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,7 +50,7 @@ jobs:
         run: python -m pytest tests/unit
       - name: Contract tests
         run: python -m pytest tests/contracts
-      - name: DynamoDB integration tests
+      - name: DynamoDB and ElasticMQ integration tests
         run: python -m pytest tests/integration
       - name: Full suite and coverage gate
         run: python -m pytest --cov=src/app --cov-report=term-missing

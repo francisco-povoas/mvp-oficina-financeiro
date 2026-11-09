@@ -25,11 +25,13 @@ CMD ["pytest", "--cov=src/app", "--cov-report=term-missing"]
 FROM base AS runtime
 
 COPY scripts/start.sh ./scripts/start.sh
+COPY scripts/start-publisher.sh ./scripts/start-publisher.sh
 COPY src ./src
+COPY contracts ./contracts
 
 RUN addgroup --system appgroup \
     && adduser --system --ingroup appgroup appuser \
-    && chmod +x ./scripts/start.sh
+    && chmod +x ./scripts/start.sh ./scripts/start-publisher.sh
 
 USER appuser
 EXPOSE 8003
