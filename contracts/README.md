@@ -13,5 +13,5 @@ Os eventos continuam somente como contratos nesta frente: não há publicação,
 - `Problem` foi alinhado ao schema comum, incluindo os limites de `message` e os campos opcionais `operation_id` e `details`.
 - respostas de sucesso e erro declaram `X-Correlation-ID`; as rotas internas exigem um UUID nesse header.
 - respostas 422 e 500 passaram a ser declaradas explicitamente, sempre no formato `Problem`.
-- `financial-status` consulta o histórico próprio por GSI e diferencia ausência, estados pendentes, `UNKNOWN` e confirmação.
+- `financial-status` consulta o histórico próprio por GSI, identifica orçamento e tentativa de pagamento com suas versões e diferencia ausência, estados pendentes, `UNKNOWN` e confirmação.
 

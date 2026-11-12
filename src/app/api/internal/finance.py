@@ -18,11 +18,18 @@ class QuoteStatusResponse(BaseModel):
     quote_version: int = Field(ge=1)
     status: str
     total: str = Field(pattern=r"^(0|[1-9][0-9]*)(\.[0-9]{2})$")
+    communicated_at: datetime | None
+    decided_at: datetime | None
+    rejection_reason: str | None
 
 
 class PaymentStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     payment_id: UUID
+    quote_id: UUID
+    quote_version: int = Field(ge=1)
+    attempt_number: int = Field(ge=1)
+    payment_version: int = Field(ge=1)
     status: str
     amount: str = Field(pattern=r"^(0|[1-9][0-9]*)(\.[0-9]{2})$")
     confirmed_at: datetime | None
@@ -66,6 +73,13 @@ def get_financial_status(
                 quote_version=quote.version,
                 status=quote.status.value,
                 total=_money(quote.total),
+                communicated_at=quote.communicated_at,
+                decided_at=(
+                    quote.updated_at
+                    if quote.status.value in {"APROVADO", "RECUSADO"}
+                    else None
+                ),
+                rejection_reason=quote.rejection_reason,
             )
             if quote
             else None
@@ -73,6 +87,10 @@ def get_financial_status(
         payment=(
             PaymentStatusResponse(
                 payment_id=payment.payment_id,
+                quote_id=payment.quote_id,
+                quote_version=payment.quote_version,
+                attempt_number=payment.attempt_number,
+                payment_version=payment.version,
                 status=payment.status.value,
                 amount=_money(payment.amount),
                 confirmed_at=(

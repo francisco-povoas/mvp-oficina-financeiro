@@ -103,6 +103,10 @@ def test_unknown_payment_status_is_accepted_by_reconciliation_contract() -> None
     Draft202012Validator(schema, format_checker=FormatChecker()).validate(
         {
             "payment_id": str(uuid4()),
+            "quote_id": str(uuid4()),
+            "quote_version": 3,
+            "attempt_number": 1,
+            "payment_version": 2,
             "status": "UNKNOWN",
             "amount": "150.00",
             "confirmed_at": None,

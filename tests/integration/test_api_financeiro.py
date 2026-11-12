@@ -198,6 +198,13 @@ def test_financial_http_flow_is_persisted_in_isolated_table() -> None:
             assert financial_status.headers["X-Correlation-ID"] == correlation_id
             assert financial_status.json()["quote"]["status"] == "APROVADO"
             assert financial_status.json()["payment"]["status"] == "CONFIRMED"
+            assert financial_status.json()["quote"]["communicated_at"] is not None
+            assert financial_status.json()["quote"]["decided_at"] is not None
+            assert financial_status.json()["quote"]["rejection_reason"] is None
+            assert financial_status.json()["payment"]["quote_id"] == quote_id
+            assert financial_status.json()["payment"]["quote_version"] == 3
+            assert financial_status.json()["payment"]["attempt_number"] == 1
+            assert financial_status.json()["payment"]["payment_version"] == 2
     finally:
         table.delete()
 
