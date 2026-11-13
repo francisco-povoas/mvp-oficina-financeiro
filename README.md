@@ -29,9 +29,10 @@ isoladas explicitamente.
 - A confirmação usa um provider simulado atrás de `PaymentProviderPort`; Mercado Pago
   não está implementado.
 
-A estrutura de Outbox é apenas persistente. Eventos, publicação, polling, Inbox,
-workers e SQS/ElasticMQ pertencem à Etapa 2. Os contratos versionados em `contracts/`
-também não significam que a consulta REST a Ordens já esteja integrada.
+A Outbox transacional e o publisher independente da Etapa 2 estão ativos. O worker
+usa o GSI2 somente para localizar candidatos e adquire cada lease por `UpdateItem`
+condicional, valida os quatro eventos financeiros v1 e os publica na FIFO de Ordens.
+Inbox, consumers e orquestração da Saga permanecem fora deste checkpoint.
 
 ## Estrutura
 
@@ -60,12 +61,25 @@ docker compose -f compose.test.yaml run --rm --build tests
 docker compose -f compose.test.yaml down --volumes --remove-orphans
 ```
 
-O health check fica em `GET /health` na porta `8003`. O CI provisiona DynamoDB Local,
-executa bootstrap, lint, testes unitários/contratuais/de integração, gate global de
-cobertura e build sem publicar a imagem.
+O health check fica em `GET /health` na porta `8003`. O CI provisiona DynamoDB Local e
+ElasticMQ, executa bootstrap, lint, testes unitários/contratuais/de integração, gate
+global de cobertura e build sem publicar a imagem.
+
+## Publisher da Outbox
+
+O publisher roda separado do FastAPI por `python -m app.publisher` ou
+`scripts/start-publisher.sh`. Lote, polling, lease, timeouts, limite de tentativas e
+backoff estão configurados por ambiente em `.env.example`; o endpoint SQS alternativo
+é rejeitado em produção.
+
+Os quatro eventos financeiros seguem para a FIFO Financeiro→Ordens com
+`MessageGroupId=payload.order_id` e `MessageDeduplicationId=message_id`. A semântica é
+at-least-once: se o broker aceitar o envio e a confirmação condicional no DynamoDB
+falhar, o lease expira e o mesmo evento pode ser reenviado. A futura Inbox será a
+proteção de negócio contra efeitos repetidos.
 
 ## Próximas integrações
 
-A Etapa 2 implementará consulta a Ordens, eventos financeiros, Outbox/Inbox e workers.
+Checkpoints posteriores implementarão consumers, Inbox e orquestração da Saga.
 Infraestrutura Kubernetes/AWS será preparada na Etapa 4. O adapter real do Mercado
 Pago, Pix e webhooks pertence somente à Etapa 5.

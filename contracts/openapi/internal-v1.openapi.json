@@ -2,15 +2,15 @@
   "openapi": "3.1.0",
   "info": {
     "title": "MVP Oficina Financeiro — API interna",
-    "version": "1.0.1",
-    "description": "Reconciliação financeira autoritativa. Implementação funcional planejada para a Etapa 2."
+    "version": "1.2.0",
+    "description": "Reconciliação financeira autoritativa implementada na frente REST da Etapa 2."
   },
   "servers": [{"url": "http://mvp-oficina-financeiro/internal/v1"}],
   "paths": {
     "/orders/{order_id}/financial-status": {
       "get": {
         "operationId": "getFinancialStatus",
-        "x-implementation-status": "planned-stage-2",
+        "x-implementation-status": "implemented-stage-2-rest",
         "x-required-scopes": ["finance:status:read"],
         "security": [{"serviceBearer": []}],
         "parameters": [
@@ -27,8 +27,7 @@
           "403": {"$ref": "#/components/responses/Forbidden"},
           "404": {"$ref": "#/components/responses/NotFound"},
           "422": {"$ref": "#/components/responses/ValidationError"},
-          "500": {"$ref": "#/components/responses/InternalError"},
-          "501": {"$ref": "#/components/responses/Planned"}
+          "500": {"$ref": "#/components/responses/InternalError"}
         }
       }
     }
@@ -75,20 +74,27 @@
       },
       "QuoteStatus": {
         "type": "object",
-        "required": ["quote_id", "quote_version", "status", "total"],
+        "required": ["quote_id", "quote_version", "status", "total", "communicated_at", "decided_at", "rejection_reason"],
         "properties": {
           "quote_id": {"type": "string", "format": "uuid"},
           "quote_version": {"type": "integer", "minimum": 1},
           "status": {"enum": ["RASCUNHO", "COMUNICADO", "APROVADO", "RECUSADO"]},
-          "total": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{2})$"}
+          "total": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{2})$"},
+          "communicated_at": {"type": ["string", "null"], "format": "date-time"},
+          "decided_at": {"type": ["string", "null"], "format": "date-time"},
+          "rejection_reason": {"type": ["string", "null"], "maxLength": 512}
         },
         "additionalProperties": false
       },
       "PaymentStatus": {
         "type": "object",
-        "required": ["payment_id", "status", "amount", "confirmed_at"],
+        "required": ["payment_id", "quote_id", "quote_version", "attempt_number", "payment_version", "status", "amount", "confirmed_at"],
         "properties": {
           "payment_id": {"type": "string", "format": "uuid"},
+          "quote_id": {"type": "string", "format": "uuid"},
+          "quote_version": {"type": "integer", "minimum": 1},
+          "attempt_number": {"type": "integer", "minimum": 1},
+          "payment_version": {"type": "integer", "minimum": 1},
           "status": {"enum": ["PENDING", "PROCESSING", "UNKNOWN", "FAILED", "EXPIRED", "REJECTED", "CONFIRMED"]},
           "amount": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{2})$"},
           "confirmed_at": {"type": ["string", "null"], "format": "date-time"}

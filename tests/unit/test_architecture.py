@@ -73,7 +73,9 @@ def test_service_uses_injected_payment_provider_before_persisting_confirmation()
 
     provider.confirm_payment.assert_called_once_with(payment_id, "raw-reference")
     repository.confirm_payment.assert_called_once_with(
-        payment_id, "normalized-reference"
+        payment_id,
+        "normalized-reference",
+        correlation_id=None,
     )
     assert result is stored
 

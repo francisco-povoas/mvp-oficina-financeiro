@@ -1,7 +1,11 @@
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from app.application.ports import FinanceRepositoryPort, PaymentProviderPort
+from app.application.ports import (
+    FinanceRepositoryPort,
+    OrdersContextPort,
+    PaymentProviderPort,
+)
 from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
 from app.domain.models import (
     CustomerContact,
@@ -18,9 +22,48 @@ class FinanceService:
         self,
         repository: FinanceRepositoryPort,
         payment_provider: PaymentProviderPort,
+        orders_context: OrdersContextPort | None = None,
     ) -> None:
         self.repository = repository
         self.payment_provider = payment_provider
+        self.orders_context = orders_context
+
+    def create_quote_from_order(
+        self,
+        *,
+        order_id: UUID,
+        correlation_id: str,
+    ) -> Quote:
+        if self.orders_context is None:
+            raise FinanceConflictError("Consulta de Ordens não configurada")
+        context = self.orders_context.get_quote_context(order_id, correlation_id)
+        return self.create_quote(
+            order_id=context.order_id,
+            order_version=context.order_version,
+            order_status=context.status,
+            services=tuple(
+                QuoteLine(
+                    reference_id=line.reference_id,
+                    description=line.description,
+                    quantity=line.quantity,
+                    unit_price=line.unit_price,
+                )
+                for line in context.services
+            ),
+            items=tuple(
+                QuoteLine(
+                    reference_id=line.reference_id,
+                    description=line.description,
+                    quantity=line.quantity,
+                    unit_price=line.unit_price,
+                )
+                for line in context.items
+            ),
+            customer_contact=CustomerContact(
+                email=context.email,
+                telefone=context.telefone,
+            ),
+        )
 
     def create_quote(
         self,
@@ -48,9 +91,15 @@ class FinanceService:
         self,
         quote_id: UUID,
         evidences: tuple[QuoteCommunicationEvidence, ...],
+        *,
+        correlation_id: UUID | None = None,
     ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.record_quote_communication(quote, evidences)
+        return self.repository.record_quote_communication(
+            quote,
+            evidences,
+            correlation_id=correlation_id,
+        )
 
     def get_quote(self, quote_id: UUID) -> Quote:
         return self._get_quote(quote_id)
@@ -61,13 +110,32 @@ class FinanceService:
         self._get_quote(quote_id)
         return self.repository.list_quote_communications(quote_id)
 
-    def approve_quote(self, quote_id: UUID) -> Quote:
+    def approve_quote(
+        self,
+        quote_id: UUID,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.save_quote_transition(quote, quote.aprovar())
+        return self.repository.save_quote_transition(
+            quote,
+            quote.aprovar(),
+            correlation_id=correlation_id,
+        )
 
-    def reject_quote(self, quote_id: UUID, reason: str | None) -> Quote:
+    def reject_quote(
+        self,
+        quote_id: UUID,
+        reason: str | None,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote:
         quote = self._get_quote(quote_id)
-        return self.repository.save_quote_transition(quote, quote.recusar(reason))
+        return self.repository.save_quote_transition(
+            quote,
+            quote.recusar(reason),
+            correlation_id=correlation_id,
+        )
 
     def create_payment(
         self,
@@ -91,15 +159,54 @@ class FinanceService:
             idempotency_key=idempotency_key,
         )
 
+    def create_payment_from_order(
+        self,
+        *,
+        quote_id: UUID,
+        method: str,
+        amount: Decimal,
+        idempotency_key: str,
+        correlation_id: str,
+    ) -> PaymentAttempt:
+        quote = self._get_quote(quote_id)
+        if quote.status != QuoteStatus.APROVADO:
+            raise FinanceConflictError("O orçamento precisa estar aprovado")
+        if self.orders_context is None:
+            raise FinanceConflictError("Consulta de Ordens não configurada")
+        self.orders_context.get_payment_context(
+            order_id=quote.order_id,
+            quote_id=quote.quote_id,
+            quote_version=quote.version,
+            approved_total=quote.total,
+            correlation_id=correlation_id,
+        )
+        return self.create_payment(
+            quote_id=quote_id,
+            method=method,
+            amount=amount,
+            idempotency_key=idempotency_key,
+        )
+
     def confirm_simulated_payment(
-        self, payment_id: UUID, provider_reference: str
+        self,
+        payment_id: UUID,
+        provider_reference: str,
+        *,
+        correlation_id: UUID | None = None,
     ) -> PaymentAttempt:
         confirmation = self.payment_provider.confirm_payment(
             payment_id, provider_reference
         )
         return self.repository.confirm_payment(
-            payment_id, confirmation.provider_reference
+            payment_id,
+            confirmation.provider_reference,
+            correlation_id=correlation_id,
         )
+
+    def get_financial_status(
+        self, order_id: UUID
+    ) -> tuple[Quote | None, PaymentAttempt | None]:
+        return self.repository.get_financial_status(order_id)
 
     def _get_quote(self, quote_id: UUID) -> Quote:
         quote = self.repository.get_quote(quote_id)

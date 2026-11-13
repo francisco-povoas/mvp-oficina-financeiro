@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -23,6 +23,7 @@ from app.domain.models import (
     RETRYABLE_PAYMENT_STATUSES,
     CustomerContact,
     OutboxRecord,
+    OutboxStatus,
     PaymentAttempt,
     PaymentStatus,
     Quote,
@@ -306,37 +307,136 @@ def payment_from_item(item: dict[str, Any]) -> PaymentAttempt:
 
 
 def outbox_to_item(record: OutboxRecord) -> dict[str, Any]:
-    return {
+    item = {
         "PK": f"OUTBOX#{record.message_id}",
         "SK": "META",
         "entity_type": "OUTBOX",
         "message_id": str(record.message_id),
         "event_type": record.event_type,
+        "event_version": record.event_version,
         "aggregate_id": str(record.aggregate_id),
         "payload": record.payload,
-        "status": record.status,
+        "correlation_id": str(record.correlation_id),
+        "operation_id": str(record.operation_id),
+        "occurred_at": record.occurred_at.isoformat(),
+        "status": record.status.value,
         "attempt_count": record.attempt_count,
         "version": record.version,
         "next_attempt_at": record.next_attempt_at.isoformat(),
         "created_at": record.created_at.isoformat(),
         "updated_at": record.updated_at.isoformat(),
-        "GSI2PK": "OUTBOX#PENDING",
-        "GSI2SK": f"{record.next_attempt_at.isoformat()}#{record.message_id}",
     }
+    optional = {
+        "causation_id": str(record.causation_id) if record.causation_id else None,
+        "claim_id": str(record.claim_id) if record.claim_id else None,
+        "claimed_by": record.claimed_by,
+        "claimed_at": record.claimed_at.isoformat() if record.claimed_at else None,
+        "claim_expires_at": (
+            record.claim_expires_at.isoformat() if record.claim_expires_at else None
+        ),
+        "published_at": record.published_at.isoformat() if record.published_at else None,
+        "last_error": record.last_error,
+        "last_failed_at": (
+            record.last_failed_at.isoformat() if record.last_failed_at else None
+        ),
+    }
+    item.update({key: value for key, value in optional.items() if value is not None})
+    if record.status == OutboxStatus.PENDING:
+        item.update(
+            {
+                "GSI2PK": "OUTBOX#PENDING",
+                "GSI2SK": f"{record.next_attempt_at.isoformat()}#{record.message_id}",
+            }
+        )
+    return item
+
+
+def _from_dynamodb_document(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return format(value, "f")
+    if isinstance(value, dict):
+        return {key: _from_dynamodb_document(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_from_dynamodb_document(item) for item in value]
+    return value
 
 
 def outbox_from_item(item: dict[str, Any]) -> OutboxRecord:
     return OutboxRecord(
         message_id=UUID(item["message_id"]),
         event_type=item["event_type"],
+        event_version=int(item["event_version"]),
         aggregate_id=UUID(item["aggregate_id"]),
-        payload=dict(item["payload"]),
+        payload=_from_dynamodb_document(item["payload"]),
+        correlation_id=UUID(item["correlation_id"]),
+        causation_id=(UUID(item["causation_id"]) if item.get("causation_id") else None),
+        operation_id=UUID(item["operation_id"]),
+        occurred_at=datetime.fromisoformat(item["occurred_at"]),
         next_attempt_at=datetime.fromisoformat(item["next_attempt_at"]),
-        status=item["status"],
+        status=OutboxStatus(item["status"]),
         attempt_count=int(item["attempt_count"]),
         version=int(item["version"]),
+        claim_id=UUID(item["claim_id"]) if item.get("claim_id") else None,
+        claimed_by=item.get("claimed_by"),
+        claimed_at=(
+            datetime.fromisoformat(item["claimed_at"]) if item.get("claimed_at") else None
+        ),
+        claim_expires_at=(
+            datetime.fromisoformat(item["claim_expires_at"])
+            if item.get("claim_expires_at")
+            else None
+        ),
+        published_at=(
+            datetime.fromisoformat(item["published_at"])
+            if item.get("published_at")
+            else None
+        ),
+        last_error=item.get("last_error"),
+        last_failed_at=(
+            datetime.fromisoformat(item["last_failed_at"])
+            if item.get("last_failed_at")
+            else None
+        ),
         created_at=datetime.fromisoformat(item["created_at"]),
         updated_at=datetime.fromisoformat(item["updated_at"]),
+    )
+
+
+def _outbox_put(record: OutboxRecord, table_name: str) -> dict[str, Any]:
+    return {
+        "Put": {
+            "TableName": table_name,
+            "Item": outbox_to_item(record),
+            "ConditionExpression": "attribute_not_exists(PK)",
+        }
+    }
+
+
+def _new_outbox_record(
+    *,
+    event_type: str,
+    aggregate_id: UUID,
+    payload: dict[str, object],
+    correlation_id: UUID | None,
+    operation_id: UUID | None = None,
+    occurred_at: datetime | None = None,
+) -> OutboxRecord:
+    now = occurred_at or datetime.now(UTC)
+    return OutboxRecord(
+        message_id=uuid4(),
+        event_type=event_type,
+        event_version=1,
+        aggregate_id=aggregate_id,
+        payload=payload,
+        correlation_id=correlation_id or uuid4(),
+        operation_id=operation_id or uuid4(),
+        causation_id=None,
+        occurred_at=now,
+        next_attempt_at=now,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -438,6 +538,8 @@ class DynamoDBFinanceRepository:
         self,
         quote: Quote,
         evidences: tuple[QuoteCommunicationEvidence, ...],
+        *,
+        correlation_id: UUID | None = None,
     ) -> Quote:
         quote.validate_communication_evidences(evidences)
         existing = self._existing_communication(evidences)
@@ -466,6 +568,20 @@ class DynamoDBFinanceRepository:
         }
         guard_key = {"PK": f"ORDER#{quote.order_id}", "SK": "QUOTE_GUARD"}
         if successful:
+            outbox = _new_outbox_record(
+                event_type="QuoteCommunicated.v1",
+                aggregate_id=updated.order_id,
+                correlation_id=correlation_id,
+                operation_id=evidences[0].communication_id,
+                occurred_at=updated.communicated_at,
+                payload={
+                    "order_id": str(updated.order_id),
+                    "quote_id": str(updated.quote_id),
+                    "quote_version": updated.version,
+                    "total": f"{updated.total:.2f}",
+                    "communicated_at": updated.communicated_at.isoformat(),
+                },
+            )
             transition_values = {
                 **values,
                 ":new_status": updated.status.value,
@@ -507,6 +623,7 @@ class DynamoDBFinanceRepository:
                             },
                         }
                     },
+                    _outbox_put(outbox, self.table.name),
                 ]
             )
         else:
@@ -553,7 +670,42 @@ class DynamoDBFinanceRepository:
             raise FinanceNotFoundError("Orçamento desapareceu após comunicação")
         return stored
 
-    def save_quote_transition(self, previous: Quote, updated: Quote) -> Quote:
+    def save_quote_transition(
+        self,
+        previous: Quote,
+        updated: Quote,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> Quote:
+        if updated.status == QuoteStatus.APROVADO:
+            outbox = _new_outbox_record(
+                event_type="QuoteApproved.v1",
+                aggregate_id=updated.order_id,
+                correlation_id=correlation_id,
+                occurred_at=updated.updated_at,
+                payload={
+                    "order_id": str(updated.order_id),
+                    "quote_id": str(updated.quote_id),
+                    "quote_version": updated.version,
+                    "approved_at": updated.updated_at.isoformat(),
+                },
+            )
+        elif updated.status == QuoteStatus.RECUSADO:
+            outbox = _new_outbox_record(
+                event_type="QuoteRejected.v1",
+                aggregate_id=updated.order_id,
+                correlation_id=correlation_id,
+                occurred_at=updated.updated_at,
+                payload={
+                    "order_id": str(updated.order_id),
+                    "quote_id": str(updated.quote_id),
+                    "quote_version": updated.version,
+                    "reason": updated.rejection_reason,
+                    "rejected_at": updated.updated_at.isoformat(),
+                },
+            )
+        else:
+            raise FinanceConflictError("Transição financeira sem evento versionado")
         try:
             self.client.transact_write_items(
                 TransactItems=[
@@ -615,6 +767,7 @@ class DynamoDBFinanceRepository:
                             },
                         }
                     },
+                    _outbox_put(outbox, self.table.name),
                 ]
             )
         except ClientError as exc:
@@ -786,13 +939,20 @@ class DynamoDBFinanceRepository:
             raise
         return payment
 
-    def confirm_payment(self, payment_id: UUID, provider_reference: str) -> PaymentAttempt:
+    def confirm_payment(
+        self,
+        payment_id: UUID,
+        provider_reference: str,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> PaymentAttempt:
         if not provider_reference.strip():
             raise FinanceConflictError("A referência externa é obrigatória")
         return self.transition_payment_status(
             payment_id,
             PaymentStatus.CONFIRMED,
             provider_reference=provider_reference,
+            correlation_id=correlation_id,
         )
 
     def transition_payment_status(
@@ -801,6 +961,7 @@ class DynamoDBFinanceRepository:
         new_status: PaymentStatus,
         *,
         provider_reference: str | None = None,
+        correlation_id: UUID | None = None,
     ) -> PaymentAttempt:
         payment = self.get_payment(payment_id)
         if payment is None:
@@ -854,6 +1015,21 @@ class DynamoDBFinanceRepository:
         }
         transaction: list[dict[str, Any]] = []
         if new_status == PaymentStatus.CONFIRMED:
+            outbox = _new_outbox_record(
+                event_type="PaymentConfirmed.v1",
+                aggregate_id=updated.order_id,
+                correlation_id=correlation_id,
+                occurred_at=updated.updated_at,
+                payload={
+                    "order_id": str(updated.order_id),
+                    "quote_id": str(updated.quote_id),
+                    "quote_version": updated.quote_version,
+                    "payment_id": str(updated.payment_id),
+                    "status": updated.status.value,
+                    "amount": f"{updated.amount:.2f}",
+                    "confirmed_at": updated.updated_at.isoformat(),
+                },
+            )
             transaction.append(
                 {
                     "Put": {
@@ -910,6 +1086,8 @@ class DynamoDBFinanceRepository:
                 },
             ]
         )
+        if new_status == PaymentStatus.CONFIRMED:
+            transaction.append(_outbox_put(outbox, self.table.name))
         try:
             self.client.transact_write_items(TransactItems=transaction)
         except ClientError as exc:
@@ -948,6 +1126,187 @@ class DynamoDBFinanceRepository:
         item = response.get("Item")
         return outbox_from_item(item) if item else None
 
+    def claim_outbox_records(
+        self,
+        *,
+        worker_id: str,
+        batch_size: int,
+        lease_duration: timedelta,
+        max_attempts: int | None = None,
+        now: datetime | None = None,
+    ) -> list[OutboxRecord]:
+        if not worker_id.strip():
+            raise ValueError("worker_id não pode ser vazio")
+        if batch_size <= 0:
+            raise ValueError("batch_size deve ser positivo")
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration deve ser positivo")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("max_attempts deve ser positivo")
+        claimed_at = now or datetime.now(UTC)
+        if claimed_at.tzinfo is None or claimed_at.utcoffset() is None:
+            raise ValueError("now deve possuir fuso horário")
+        claim_expires_at = claimed_at + lease_duration
+        upper_bound = f"{claimed_at.isoformat()}#~"
+        query: dict[str, Any] = {
+            "IndexName": "GSI2",
+            "KeyConditionExpression": (
+                Key("GSI2PK").eq("OUTBOX#PENDING")
+                & Key("GSI2SK").lte(upper_bound)
+            ),
+            "Limit": max(batch_size * 2, 10),
+        }
+        claimed: list[OutboxRecord] = []
+        while len(claimed) < batch_size:
+            response = self.table.query(**query)
+            for candidate in response.get("Items", []):
+                claim_id = uuid4()
+                condition = (
+                    "#status=:pending AND #version=:version "
+                    "AND next_attempt_at<=:now AND "
+                    "(attribute_not_exists(claim_expires_at) "
+                    "OR claim_expires_at<=:now)"
+                )
+                expression_values = {
+                    ":claim_id": str(claim_id),
+                    ":worker": worker_id,
+                    ":claimed_at": claimed_at.isoformat(),
+                    ":expires_at": claim_expires_at.isoformat(),
+                    ":one": 1,
+                    ":updated": claimed_at.isoformat(),
+                    ":pending": OutboxStatus.PENDING.value,
+                    ":version": candidate["version"],
+                    ":now": claimed_at.isoformat(),
+                }
+                if max_attempts is not None:
+                    condition += " AND attempt_count<:max_attempts"
+                    expression_values[":max_attempts"] = max_attempts
+                try:
+                    updated = self.table.update_item(
+                        Key={"PK": candidate["PK"], "SK": candidate["SK"]},
+                        UpdateExpression=(
+                            "SET claim_id=:claim_id, claimed_by=:worker, "
+                            "claimed_at=:claimed_at, claim_expires_at=:expires_at, "
+                            "attempt_count=attempt_count+:one, #version=#version+:one, "
+                            "updated_at=:updated"
+                        ),
+                        ConditionExpression=condition,
+                        ExpressionAttributeNames={
+                            "#status": "status",
+                            "#version": "version",
+                        },
+                        ExpressionAttributeValues=expression_values,
+                        ReturnValues="ALL_NEW",
+                    )["Attributes"]
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                        continue
+                    raise
+                claimed.append(outbox_from_item(updated))
+                if len(claimed) == batch_size:
+                    return claimed
+            last_key = response.get("LastEvaluatedKey")
+            if last_key is None:
+                return claimed
+            query["ExclusiveStartKey"] = last_key
+        return claimed
+
+    def mark_outbox_published(
+        self,
+        *,
+        message_id: UUID,
+        claim_id: UUID,
+        published_at: datetime | None = None,
+    ) -> OutboxRecord:
+        publication_time = published_at or datetime.now(UTC)
+        if publication_time.tzinfo is None or publication_time.utcoffset() is None:
+            raise ValueError("published_at deve possuir fuso horário")
+        try:
+            item = self.table.update_item(
+                Key={"PK": f"OUTBOX#{message_id}", "SK": "META"},
+                UpdateExpression=(
+                    "SET #status=:published, published_at=:published_at, "
+                    "#version=#version+:one, updated_at=:updated "
+                    "REMOVE GSI2PK, GSI2SK, claim_id, claimed_by, claimed_at, "
+                    "claim_expires_at"
+                ),
+                ConditionExpression=(
+                    "#status=:pending AND claim_id=:claim_id "
+                    "AND claim_expires_at>:published_at"
+                ),
+                ExpressionAttributeNames={
+                    "#status": "status",
+                    "#version": "version",
+                },
+                ExpressionAttributeValues={
+                    ":published": OutboxStatus.PUBLISHED.value,
+                    ":pending": OutboxStatus.PENDING.value,
+                    ":published_at": publication_time.isoformat(),
+                    ":claim_id": str(claim_id),
+                    ":one": 1,
+                    ":updated": publication_time.isoformat(),
+                },
+                ReturnValues="ALL_NEW",
+            )["Attributes"]
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise FinanceConflictError("Claim da Outbox não está mais ativo") from exc
+            raise
+        return outbox_from_item(item)
+
+    def mark_outbox_failed(
+        self,
+        *,
+        message_id: UUID,
+        claim_id: UUID,
+        error: str,
+        next_attempt_at: datetime,
+        failed_at: datetime | None = None,
+    ) -> OutboxRecord:
+        failure_time = failed_at or datetime.now(UTC)
+        if failure_time.tzinfo is None or failure_time.utcoffset() is None:
+            raise ValueError("failed_at deve possuir fuso horário")
+        if next_attempt_at.tzinfo is None or next_attempt_at.utcoffset() is None:
+            raise ValueError("next_attempt_at deve possuir fuso horário")
+        if not error.strip():
+            raise ValueError("error não pode ser vazio")
+        if next_attempt_at < failure_time:
+            raise ValueError("next_attempt_at não pode anteceder failed_at")
+        try:
+            item = self.table.update_item(
+                Key={"PK": f"OUTBOX#{message_id}", "SK": "META"},
+                UpdateExpression=(
+                    "SET next_attempt_at=:next_attempt, GSI2SK=:gsi2sk, "
+                    "last_error=:error, last_failed_at=:failed_at, "
+                    "#version=#version+:one, updated_at=:updated "
+                    "REMOVE claim_id, claimed_by, claimed_at, claim_expires_at"
+                ),
+                ConditionExpression=(
+                    "#status=:pending AND claim_id=:claim_id "
+                    "AND claim_expires_at>:failed_at"
+                ),
+                ExpressionAttributeNames={
+                    "#status": "status",
+                    "#version": "version",
+                },
+                ExpressionAttributeValues={
+                    ":next_attempt": next_attempt_at.isoformat(),
+                    ":gsi2sk": f"{next_attempt_at.isoformat()}#{message_id}",
+                    ":error": error,
+                    ":failed_at": failure_time.isoformat(),
+                    ":pending": OutboxStatus.PENDING.value,
+                    ":claim_id": str(claim_id),
+                    ":one": 1,
+                    ":updated": failure_time.isoformat(),
+                },
+                ReturnValues="ALL_NEW",
+            )["Attributes"]
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise FinanceConflictError("Claim da Outbox não está mais ativo") from exc
+            raise
+        return outbox_from_item(item)
+
     def list_order_history(self, order_id: UUID) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         query: dict[str, Any] = {
@@ -961,3 +1320,25 @@ class DynamoDBFinanceRepository:
             if last_key is None:
                 return items
             query["ExclusiveStartKey"] = last_key
+
+    def get_financial_status(
+        self, order_id: UUID
+    ) -> tuple[Quote | None, PaymentAttempt | None]:
+        history = self.list_order_history(order_id)
+        quotes = [
+            quote_from_item(item)
+            for item in history
+            if item.get("entity_type") == "QUOTE"
+        ]
+        payments = [
+            payment_from_item(item)
+            for item in history
+            if item.get("entity_type") == "PAYMENT"
+        ]
+        quote = max(quotes, key=lambda item: item.created_at, default=None)
+        payment = max(
+            payments,
+            key=lambda item: (item.attempt_number, item.created_at),
+            default=None,
+        )
+        return quote, payment

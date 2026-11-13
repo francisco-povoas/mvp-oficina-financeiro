@@ -17,6 +17,11 @@ CORRELATION_ID = str(uuid4())
 SECRET = "segredo-hs256-exclusivo-dos-testes"
 
 
+class FakeFinanceService:
+    def get_financial_status(self, order_id):
+        return None, None
+
+
 def _assert_problem(response, status_code: int, correlation_id: str | None = None) -> None:
     assert response.status_code == status_code
     Draft202012Validator(PROBLEM, format_checker=FormatChecker()).validate(
@@ -40,7 +45,7 @@ def test_success_response_echoes_correlation_id() -> None:
     assert response.headers["X-Correlation-ID"] == CORRELATION_ID
 
 
-def test_authentication_authorization_validation_and_planned_responses() -> None:
+def test_authentication_authorization_validation_and_not_found_responses() -> None:
     settings = Settings(
         environment="test", jwt_secret_key=SECRET, dynamodb_table="test-table"
     )
@@ -64,7 +69,7 @@ def test_authentication_authorization_validation_and_planned_responses() -> None
     )["access_token"]
     path = f"/internal/v1/orders/{uuid4()}/financial-status"
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings, finance_service=FakeFinanceService())) as client:
         unauthorized = client.get(
             path, headers={"X-Correlation-ID": CORRELATION_ID}
         )
@@ -75,7 +80,7 @@ def test_authentication_authorization_validation_and_planned_responses() -> None
                 "Authorization": f"Bearer {wrong_scope}",
             },
         )
-        planned = client.get(
+        not_found = client.get(
             path,
             headers={
                 "X-Correlation-ID": CORRELATION_ID,
@@ -88,9 +93,9 @@ def test_authentication_authorization_validation_and_planned_responses() -> None
 
     _assert_problem(unauthorized, 401, CORRELATION_ID)
     _assert_problem(forbidden, 403, CORRELATION_ID)
-    _assert_problem(planned, 501, CORRELATION_ID)
+    _assert_problem(not_found, 404, CORRELATION_ID)
     _assert_problem(missing_correlation, 422)
-    assert planned.json()["code"] == "INTEGRATION_PLANNED"
+    assert not_found.json()["code"] == "FINANCIAL_STATUS_NOT_FOUND"
 
 
 def test_unknown_payment_status_is_accepted_by_reconciliation_contract() -> None:
@@ -98,6 +103,10 @@ def test_unknown_payment_status_is_accepted_by_reconciliation_contract() -> None
     Draft202012Validator(schema, format_checker=FormatChecker()).validate(
         {
             "payment_id": str(uuid4()),
+            "quote_id": str(uuid4()),
+            "quote_version": 3,
+            "attempt_number": 1,
+            "payment_version": 2,
             "status": "UNKNOWN",
             "amount": "150.00",
             "confirmed_at": None,
