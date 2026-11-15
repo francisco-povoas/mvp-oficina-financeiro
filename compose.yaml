@@ -7,6 +7,10 @@ services:
       - "8004:8000"
     volumes:
       - financeiro_dynamodb:/home/dynamodblocal/data
+    networks:
+      default: {}
+      messaging:
+        aliases: [financeiro-dynamodb-shared]
 
   api:
     build:
@@ -22,10 +26,23 @@ services:
       AWS_SECRET_ACCESS_KEY: local
       JWT_SECRET_KEY: chave-local-nao-usar-em-producao
       JWT_ALGORITHM: HS256
+      INTERNAL_AUTH_URL: http://ordens-api:8001/internal/v1/auth/token
+      ORDERS_BASE_URL: http://ordens-api:8001
+      SERVICE_CLIENT_ID: mvp-oficina-financeiro
+      SERVICE_CLIENT_SECRET: ${LOCAL_SERVICE_CLIENT_SECRET:?use --env-file da Infra}
     ports:
       - "8003:8003"
     depends_on:
       - dynamodb
+    networks:
+      default: {}
+      messaging:
+        aliases: [financeiro-api]
 
 volumes:
   financeiro_dynamodb:
+
+networks:
+  messaging:
+    name: mvp-oficina-distributed-foundation_service-mesh
+    external: true
