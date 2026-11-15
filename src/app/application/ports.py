@@ -7,6 +7,7 @@ from uuid import UUID
 from app.domain.models import (
     OutboxRecord,
     PaymentAttempt,
+    PaymentStatus,
     Quote,
     QuoteCommunicationEvidence,
 )
@@ -48,6 +49,27 @@ class FinanceRepositoryPort(Protocol):
         method: str,
         amount: Decimal,
         idempotency_key: str,
+        provider: str = "simulated",
+    ) -> PaymentAttempt: ...
+
+    def get_payment(self, payment_id: UUID) -> PaymentAttempt | None: ...
+
+    def record_provider_payment(
+        self,
+        payment_id: UUID,
+        *,
+        provider_reference: str,
+        checkout_url: str | None,
+        status: PaymentStatus,
+    ) -> PaymentAttempt: ...
+
+    def transition_payment_status(
+        self,
+        payment_id: UUID,
+        new_status: PaymentStatus,
+        *,
+        provider_reference: str | None = None,
+        correlation_id: UUID | None = None,
     ) -> PaymentAttempt: ...
 
     def confirm_payment(
@@ -100,8 +122,42 @@ class PaymentConfirmation:
     provider_reference: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class ProviderPayment:
+    provider_reference: str
+    external_reference: str
+    status: str
+    status_detail: str
+    amount: Decimal
+    currency: str
+    live_mode: bool
+    checkout_url: str | None = None
+
+
 class PaymentProviderPort(Protocol):
     """External payment provider used by the application."""
+
+    name: str
+    currency: str
+
+    def create_payment(
+        self,
+        payment: PaymentAttempt,
+        *,
+        payer_email: str,
+    ) -> ProviderPayment | None: ...
+
+    def get_payment(self, provider_reference: str) -> ProviderPayment: ...
+
+    def find_payment(self, external_reference: str) -> ProviderPayment | None: ...
+
+    def validate_webhook(
+        self,
+        *,
+        signature: str,
+        request_id: str,
+        data_id: str,
+    ) -> None: ...
 
     def confirm_payment(
         self, payment_id: UUID, provider_reference: str

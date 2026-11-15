@@ -13,6 +13,8 @@ from boto3.dynamodb.conditions import Key
 from jsonschema import Draft202012Validator, FormatChecker
 
 import app.infrastructure.dynamodb as dynamodb_module
+from app.application.ports import ProviderPayment
+from app.application.services import FinanceService
 from app.config import Settings
 from app.domain.exceptions import FinanceConflictError, IdempotencyConflictError
 from app.domain.models import (
@@ -140,6 +142,34 @@ def make_outbox_record(*, occurred_at: datetime | None = None) -> OutboxRecord:
         occurred_at=now,
         next_attempt_at=now,
     )
+
+
+class FakeMercadoPagoProvider:
+    name = "mercado_pago"
+    currency = "BRL"
+
+    def __init__(self, result: ProviderPayment) -> None:
+        self.result = result
+
+    def create_payment(self, payment, *, payer_email):
+        del payment, payer_email
+        return self.result
+
+    def get_payment(self, provider_reference):
+        assert provider_reference == self.result.provider_reference
+        return self.result
+
+    def find_payment(self, external_reference):
+        assert external_reference == self.result.external_reference
+        return self.result
+
+    def validate_webhook(self, *, signature, request_id, data_id):
+        assert signature == "valid"
+        assert request_id == "request-id"
+        assert data_id == self.result.provider_reference
+
+    def confirm_payment(self, payment_id, provider_reference):
+        raise AssertionError("confirmação simulada não pode ser usada")
 
 
 def pending_outbox(repository) -> list[OutboxRecord]:
@@ -830,3 +860,93 @@ def test_outbox_claim_respects_max_attempts_conditionally(repository) -> None:
     assert exhausted.status == OutboxStatus.PENDING
     assert exhausted.attempt_count == 1
     assert exhausted.last_error == "falha final"
+
+
+def test_mercado_pago_callback_is_idempotent_and_does_not_regress(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    payment = repository.create_payment(
+        order_id=quote.order_id,
+        quote_id=quote.quote_id,
+        quote_version=quote.version,
+        method="PIX",
+        amount=quote.total,
+        idempotency_key="mp-callback",
+        provider="mercado_pago",
+    )
+    approved = ProviderPayment(
+        provider_reference="987654321",
+        external_reference=str(payment.payment_id),
+        status="approved",
+        status_detail="accredited",
+        amount=payment.amount,
+        currency="BRL",
+        live_mode=False,
+        checkout_url="https://sandbox.test/pix/987654321",
+    )
+    provider = FakeMercadoPagoProvider(approved)
+    service = FinanceService(repository, provider)
+
+    first = service.process_provider_webhook(
+        provider_reference="987654321",
+        signature="valid",
+        request_id="request-id",
+    )
+    duplicate = service.process_provider_webhook(
+        provider_reference="987654321",
+        signature="valid",
+        request_id="request-id",
+    )
+    provider.result = replace(
+        approved,
+        status="rejected",
+        status_detail="cc_rejected_other_reason",
+    )
+    out_of_order = service.process_provider_webhook(
+        provider_reference="987654321",
+        signature="valid",
+        request_id="request-id",
+    )
+
+    assert first.status == PaymentStatus.CONFIRMED
+    assert duplicate == first
+    assert out_of_order == first
+    records = [
+        record
+        for record in pending_outbox(repository)
+        if record.event_type == "PaymentConfirmed.v1"
+    ]
+    assert len(records) == 1
+    assert get_guard(repository, quote)["status"] == PaymentStatus.CONFIRMED
+
+
+def test_provider_reference_keeps_payment_guard_active(repository) -> None:
+    quote = repository.create_quote(make_quote())
+    payment = repository.create_payment(
+        order_id=quote.order_id,
+        quote_id=quote.quote_id,
+        quote_version=quote.version,
+        method="PIX",
+        amount=quote.total,
+        idempotency_key="mp-processing",
+        provider="mercado_pago",
+    )
+    processing = repository.record_provider_payment(
+        payment.payment_id,
+        provider_reference="123456789",
+        checkout_url="https://sandbox.test/pix/123456789",
+        status=PaymentStatus.PROCESSING,
+    )
+
+    assert processing.provider_reference == "123456789"
+    assert processing.checkout_url == "https://sandbox.test/pix/123456789"
+    assert get_guard(repository, quote)["status"] == PaymentStatus.PROCESSING
+    with pytest.raises(FinanceConflictError, match="pagamento ativo"):
+        repository.create_payment(
+            order_id=quote.order_id,
+            quote_id=quote.quote_id,
+            quote_version=quote.version,
+            method="PIX",
+            amount=quote.total,
+            idempotency_key="mp-second-attempt",
+            provider="mercado_pago",
+        )

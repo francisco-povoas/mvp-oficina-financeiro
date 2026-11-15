@@ -5,11 +5,20 @@ from app.application.ports import (
     FinanceRepositoryPort,
     OrdersContextPort,
     PaymentProviderPort,
+    ProviderPayment,
 )
-from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
+from app.domain.exceptions import (
+    FinanceConflictError,
+    FinanceNotFoundError,
+    PaymentProviderContractError,
+    PaymentProviderRejectedError,
+    PaymentProviderTimeoutError,
+    PaymentProviderUnavailableError,
+)
 from app.domain.models import (
     CustomerContact,
     PaymentAttempt,
+    PaymentStatus,
     Quote,
     QuoteCommunicationEvidence,
     QuoteLine,
@@ -150,14 +159,39 @@ class FinanceService:
             raise FinanceConflictError("O orçamento precisa estar aprovado")
         if amount < quote.total:
             raise FinanceConflictError("O valor não pode ser menor que o orçamento aprovado")
-        return self.repository.create_payment(
+        payment = self.repository.create_payment(
             order_id=quote.order_id,
             quote_id=quote.quote_id,
             quote_version=quote.version,
             method=method,
             amount=amount,
             idempotency_key=idempotency_key,
+            provider=self.payment_provider.name,
         )
+        if payment.status == PaymentStatus.CONFIRMED:
+            return payment
+        try:
+            provider_payment = self.payment_provider.create_payment(
+                payment,
+                payer_email=quote.customer_contact.email,
+            )
+        except PaymentProviderRejectedError:
+            self.repository.transition_payment_status(
+                payment.payment_id, PaymentStatus.FAILED
+            )
+            raise
+        except (
+            PaymentProviderContractError,
+            PaymentProviderTimeoutError,
+            PaymentProviderUnavailableError,
+        ):
+            self.repository.transition_payment_status(
+                payment.payment_id, PaymentStatus.UNKNOWN
+            )
+            raise
+        if provider_payment is None:
+            return payment
+        return self._apply_provider_payment(payment, provider_payment)
 
     def create_payment_from_order(
         self,
@@ -201,6 +235,118 @@ class FinanceService:
             payment_id,
             confirmation.provider_reference,
             correlation_id=correlation_id,
+        )
+
+    def process_provider_webhook(
+        self,
+        *,
+        provider_reference: str,
+        signature: str,
+        request_id: str,
+        correlation_id: UUID | None = None,
+    ) -> PaymentAttempt:
+        self.payment_provider.validate_webhook(
+            signature=signature,
+            request_id=request_id,
+            data_id=provider_reference,
+        )
+        provider_payment = self.payment_provider.get_payment(provider_reference)
+        try:
+            payment_id = UUID(provider_payment.external_reference)
+        except ValueError as exc:
+            raise FinanceConflictError(
+                "Referência externa do provedor não identifica uma tentativa"
+            ) from exc
+        payment = self.repository.get_payment(payment_id)
+        if payment is None:
+            raise FinanceNotFoundError("Pagamento não encontrado")
+        return self._apply_provider_payment(
+            payment,
+            provider_payment,
+            correlation_id=correlation_id,
+        )
+
+    def reconcile_payment(
+        self,
+        payment_id: UUID,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> PaymentAttempt:
+        payment = self.repository.get_payment(payment_id)
+        if payment is None:
+            raise FinanceNotFoundError("Pagamento não encontrado")
+        if payment.status == PaymentStatus.CONFIRMED:
+            return payment
+        provider_payment = (
+            self.payment_provider.get_payment(payment.provider_reference)
+            if payment.provider_reference
+            else self.payment_provider.find_payment(str(payment.payment_id))
+        )
+        if provider_payment is None:
+            if payment.status != PaymentStatus.UNKNOWN:
+                return self.repository.transition_payment_status(
+                    payment.payment_id,
+                    PaymentStatus.UNKNOWN,
+                    correlation_id=correlation_id,
+                )
+            return payment
+        return self._apply_provider_payment(
+            payment,
+            provider_payment,
+            correlation_id=correlation_id,
+        )
+
+    def _apply_provider_payment(
+        self,
+        payment: PaymentAttempt,
+        provider_payment: ProviderPayment,
+        *,
+        correlation_id: UUID | None = None,
+    ) -> PaymentAttempt:
+        if provider_payment.external_reference != str(payment.payment_id):
+            raise FinanceConflictError("Referência externa do provedor é incompatível")
+        if provider_payment.amount != payment.amount:
+            raise FinanceConflictError("Valor autoritativo do provedor é incompatível")
+        if provider_payment.currency != self.payment_provider.currency:
+            raise FinanceConflictError("Moeda autoritativa do provedor é incompatível")
+        if provider_payment.live_mode:
+            raise FinanceConflictError("Pagamento real não é aceito neste ambiente")
+        if payment.provider != self.payment_provider.name:
+            raise FinanceConflictError("Tentativa pertence a outro provedor")
+        if payment.status == PaymentStatus.CONFIRMED:
+            if payment.provider_reference != provider_payment.provider_reference:
+                raise FinanceConflictError("Pagamento já confirmado com outra referência")
+            return payment
+
+        status = provider_payment.status.lower()
+        if status == "approved":
+            linked = self.repository.record_provider_payment(
+                payment.payment_id,
+                provider_reference=provider_payment.provider_reference,
+                checkout_url=provider_payment.checkout_url,
+                status=PaymentStatus.PROCESSING,
+            )
+            return self.repository.confirm_payment(
+                linked.payment_id,
+                provider_payment.provider_reference,
+                correlation_id=correlation_id,
+            )
+        target = {
+            "pending": PaymentStatus.PROCESSING,
+            "in_process": PaymentStatus.PROCESSING,
+            "authorized": PaymentStatus.PROCESSING,
+            "rejected": PaymentStatus.REJECTED,
+            "cancelled": (
+                PaymentStatus.EXPIRED
+                if provider_payment.status_detail == "expired"
+                else PaymentStatus.FAILED
+            ),
+        }.get(status, PaymentStatus.UNKNOWN)
+        return self.repository.record_provider_payment(
+            payment.payment_id,
+            provider_reference=provider_payment.provider_reference,
+            checkout_url=provider_payment.checkout_url,
+            status=target,
         )
 
     def get_financial_status(
