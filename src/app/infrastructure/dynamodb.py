@@ -50,6 +50,7 @@ ALLOWED_PAYMENT_TRANSITIONS = {
         PaymentStatus.UNKNOWN,
     },
     PaymentStatus.UNKNOWN: {
+        PaymentStatus.PROCESSING,
         PaymentStatus.CONFIRMED,
         PaymentStatus.FAILED,
         PaymentStatus.EXPIRED,
@@ -280,6 +281,7 @@ def payment_to_item(payment: PaymentAttempt) -> dict[str, Any]:
         "amount": payment.amount,
         "provider": payment.provider,
         "provider_reference": payment.provider_reference or "",
+        "checkout_url": payment.checkout_url or "",
         "version": payment.version,
         "created_at": payment.created_at.isoformat(),
         "updated_at": payment.updated_at.isoformat(),
@@ -300,6 +302,7 @@ def payment_from_item(item: dict[str, Any]) -> PaymentAttempt:
         amount=Decimal(item["amount"]),
         provider=item["provider"],
         provider_reference=item.get("provider_reference") or None,
+        checkout_url=item.get("checkout_url") or None,
         version=int(item["version"]),
         created_at=datetime.fromisoformat(item["created_at"]),
         updated_at=datetime.fromisoformat(item["updated_at"]),
@@ -812,6 +815,7 @@ class DynamoDBFinanceRepository:
         method: str,
         amount: Decimal,
         idempotency_key: str,
+        provider: str = "simulated",
     ) -> PaymentAttempt:
         request_body = {
             "order_id": str(order_id),
@@ -819,6 +823,7 @@ class DynamoDBFinanceRepository:
             "quote_version": quote_version,
             "method": method,
             "amount": format(amount.normalize(), "f"),
+            "provider": provider,
         }
         request_hash = hashlib.sha256(
             json.dumps(request_body, sort_keys=True).encode()
@@ -864,6 +869,7 @@ class DynamoDBFinanceRepository:
             status=PaymentStatus.PENDING,
             method=method,
             amount=amount,
+            provider=provider,
         )
         idem_item = {
             **idem_key,
@@ -939,6 +945,135 @@ class DynamoDBFinanceRepository:
             raise
         return payment
 
+    def record_provider_payment(
+        self,
+        payment_id: UUID,
+        *,
+        provider_reference: str,
+        checkout_url: str | None,
+        status: PaymentStatus,
+    ) -> PaymentAttempt:
+        if not provider_reference.strip():
+            raise FinanceConflictError("A referência externa é obrigatória")
+        payment = self.get_payment(payment_id)
+        if payment is None:
+            raise FinanceNotFoundError("Pagamento não encontrado")
+        if payment.provider_reference not in {None, provider_reference}:
+            raise FinanceConflictError("Tentativa vinculada a outra referência externa")
+        effective_checkout_url = checkout_url or payment.checkout_url
+        if payment.status == PaymentStatus.CONFIRMED:
+            return payment
+        if status != payment.status and status not in ALLOWED_PAYMENT_TRANSITIONS.get(
+            payment.status, set()
+        ):
+            raise FinanceConflictError("Transição de pagamento não permitida")
+        if (
+            payment.status == status
+            and payment.provider_reference == provider_reference
+            and payment.checkout_url == effective_checkout_url
+        ):
+            return payment
+
+        guard_key = {"PK": f"ORDER#{payment.order_id}", "SK": "PAYMENT_GUARD"}
+        guard = self.table.get_item(Key=guard_key, ConsistentRead=True).get("Item")
+        if (
+            guard is None
+            or guard.get("payment_id") != str(payment_id)
+            or guard.get("status") != payment.status.value
+        ):
+            raise FinanceConflictError("PAYMENT_GUARD inconsistente com a tentativa")
+        now = datetime.now(UTC)
+        updated = replace(
+            payment,
+            status=status,
+            provider_reference=provider_reference,
+            checkout_url=effective_checkout_url,
+            version=payment.version + 1,
+            updated_at=now,
+        )
+        try:
+            self.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": {
+                                "PK": f"PROVIDER_REF#{payment.provider}#{provider_reference}",
+                                "SK": "LOCK",
+                                "payment_id": str(payment_id),
+                            },
+                            "ConditionExpression": (
+                                "attribute_not_exists(PK) OR payment_id = :payment_id"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":payment_id": str(payment_id)
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {"PK": f"PAYMENT#{payment_id}", "SK": "META"},
+                            "UpdateExpression": (
+                                "SET #status=:new_status, provider_reference=:reference, "
+                                "checkout_url=:checkout_url, #version=:new_version, "
+                                "updated_at=:updated"
+                            ),
+                            "ConditionExpression": "#status=:old AND #version=:version",
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#version": "version",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":new_status": status.value,
+                                ":old": payment.status.value,
+                                ":version": payment.version,
+                                ":new_version": updated.version,
+                                ":reference": provider_reference,
+                                ":checkout_url": effective_checkout_url or "",
+                                ":updated": now.isoformat(),
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": guard_key,
+                            "UpdateExpression": (
+                                "SET #status=:new_status, #version=:new_version"
+                            ),
+                            "ConditionExpression": (
+                                "payment_id=:payment_id AND #status=:old "
+                                "AND #version=:version"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#status": "status",
+                                "#version": "version",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":payment_id": str(payment_id),
+                                ":new_status": status.value,
+                                ":old": payment.status.value,
+                                ":version": int(guard["version"]),
+                                ":new_version": int(guard["version"]) + 1,
+                            },
+                        }
+                    },
+                ]
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "TransactionCanceledException":
+                concurrent = self.get_payment(payment_id)
+                if (
+                    concurrent is not None
+                    and concurrent.status == status
+                    and concurrent.provider_reference == provider_reference
+                ):
+                    return concurrent
+                raise FinanceConflictError("Conflito ao vincular provedor") from exc
+            raise
+        return updated
+
     def confirm_payment(
         self,
         payment_id: UUID,
@@ -977,8 +1112,7 @@ class DynamoDBFinanceRepository:
             raise FinanceConflictError("Transição de pagamento não permitida")
         if new_status == PaymentStatus.CONFIRMED and not provider_reference:
             raise FinanceConflictError("A referência externa é obrigatória")
-        if new_status != PaymentStatus.CONFIRMED and provider_reference is not None:
-            raise FinanceConflictError("Referência externa só é aceita na confirmação")
+        effective_reference = provider_reference or payment.provider_reference
 
         guard_key = {"PK": f"ORDER#{payment.order_id}", "SK": "PAYMENT_GUARD"}
         guard = self.table.get_item(Key=guard_key, ConsistentRead=True).get("Item")
@@ -994,7 +1128,7 @@ class DynamoDBFinanceRepository:
         updated = replace(
             payment,
             status=new_status,
-            provider_reference=provider_reference,
+            provider_reference=effective_reference,
             version=payment.version + 1,
             updated_at=now,
         )
@@ -1003,7 +1137,7 @@ class DynamoDBFinanceRepository:
             ":old": payment.status.value,
             ":version": payment.version,
             ":new_version": updated.version,
-            ":reference": provider_reference or "",
+            ":reference": effective_reference or "",
             ":updated": now.isoformat(),
         }
         guard_values = {
@@ -1036,12 +1170,15 @@ class DynamoDBFinanceRepository:
                         "TableName": self.table.name,
                         "Item": {
                             "PK": (
-                                f"PROVIDER_REF#{payment.provider}#{provider_reference}"
+                                f"PROVIDER_REF#{payment.provider}#{effective_reference}"
                             ),
                             "SK": "LOCK",
                             "payment_id": str(payment_id),
                         },
-                        "ConditionExpression": "attribute_not_exists(PK)",
+                        "ConditionExpression": (
+                            "attribute_not_exists(PK) OR payment_id = :payment_id"
+                        ),
+                        "ExpressionAttributeValues": {":payment_id": str(payment_id)},
                     }
                 }
             )
@@ -1096,7 +1233,7 @@ class DynamoDBFinanceRepository:
                 if (
                     concurrent is not None
                     and concurrent.status == new_status
-                    and concurrent.provider_reference == provider_reference
+                    and concurrent.provider_reference == effective_reference
                 ):
                     return concurrent
                 raise FinanceConflictError("Conflito ao atualizar pagamento") from exc

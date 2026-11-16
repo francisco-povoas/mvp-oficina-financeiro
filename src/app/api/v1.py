@@ -3,10 +3,14 @@ from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.domain.exceptions import FinanceConflictError, FinanceNotFoundError
+from app.domain.exceptions import (
+    FinanceConflictError,
+    FinanceNotFoundError,
+    InvalidWebhookSignatureError,
+)
 from app.domain.models import (
     PaymentAttempt,
     Quote,
@@ -135,6 +139,7 @@ def _payment_response(payment: PaymentAttempt) -> dict:
         "amount": payment.amount,
         "provider": payment.provider,
         "provider_reference": payment.provider_reference,
+        "checkout_url": payment.checkout_url,
         "version": payment.version,
     }
 
@@ -274,6 +279,59 @@ def confirm_payment(
             service.confirm_simulated_payment(
                 payment_id,
                 body.provider_reference,
+                correlation_id=request.state.correlation_id,
+            )
+        )
+    except FinanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FinanceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/payments/mercado-pago/webhook", status_code=200)
+def mercado_pago_webhook(
+    request: Request,
+    service: ServiceDep,
+    data_id: Annotated[str, Query(alias="data.id")],
+    x_signature: Annotated[str, Header(alias="x-signature")],
+    x_request_id: Annotated[str, Header(alias="x-request-id")],
+    notification_type: Annotated[str | None, Query(alias="type")] = None,
+) -> dict:
+    if notification_type not in {None, "payment"}:
+        return {"accepted": True, "ignored": True}
+    try:
+        payment = service.process_provider_webhook(
+            provider_reference=data_id,
+            signature=x_signature,
+            request_id=x_request_id,
+            correlation_id=request.state.correlation_id,
+        )
+        return {
+            "accepted": True,
+            "payment_id": payment.payment_id,
+            "status": payment.status.value,
+        }
+    except InvalidWebhookSignatureError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except FinanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FinanceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/payments/{payment_id}/reconcile",
+    dependencies=[_ADMIN_ATENDENTE],
+)
+def reconcile_payment(
+    payment_id: UUID,
+    request: Request,
+    service: ServiceDep,
+) -> dict:
+    try:
+        return _payment_response(
+            service.reconcile_payment(
+                payment_id,
                 correlation_id=request.state.correlation_id,
             )
         )

@@ -231,6 +231,7 @@ class PaymentAttempt:
     amount: Decimal
     provider: str = "simulated"
     provider_reference: str | None = None
+    checkout_url: str | None = None
     version: int = 1
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -240,6 +241,8 @@ class PaymentAttempt:
             raise ValueError("O valor do pagamento deve ser positivo")
         if self.attempt_number < 1:
             raise ValueError("O número da tentativa deve ser positivo")
+        if not self.provider.strip():
+            raise ValueError("O provedor do pagamento é obrigatório")
 
 
 @dataclass(frozen=True, kw_only=True)

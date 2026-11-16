@@ -8,8 +8,15 @@ from app.api.v1 import router as v1_router
 from app.application.ports import OrdersContextPort
 from app.application.services import FinanceService
 from app.config import Settings, get_settings
+from app.domain.exceptions import (
+    PaymentProviderContractError,
+    PaymentProviderRejectedError,
+    PaymentProviderTimeoutError,
+    PaymentProviderUnavailableError,
+)
 from app.http_contract import install_http_contract, problem_response
 from app.infrastructure.dynamodb import DynamoDBFinanceRepository, dynamodb_resource
+from app.infrastructure.mercado_pago import MercadoPagoPaymentProvider
 from app.infrastructure.payment_provider import SimulatedPaymentProvider
 from app.integrations.http import (
     DependencyAuthenticationError,
@@ -76,9 +83,14 @@ def create_app(
         table = dynamodb_resource(resolved_settings).Table(
             resolved_settings.dynamodb_table
         )
+        payment_provider = (
+            MercadoPagoPaymentProvider(resolved_settings)
+            if resolved_settings.payment_provider == "mercado_pago"
+            else SimulatedPaymentProvider()
+        )
         finance_service = FinanceService(
             repository=DynamoDBFinanceRepository(table),
-            payment_provider=SimulatedPaymentProvider(),
+            payment_provider=payment_provider,
             orders_context=orders_context,
         )
     app.state.finance_service = finance_service
@@ -110,6 +122,26 @@ def create_app(
     app.add_exception_handler(
         OrdersContextConflict,
         _dependency_handler(409, "ORDER_CONTEXT_CONFLICT", "Estado da ordem incompatível"),
+    )
+    app.add_exception_handler(
+        PaymentProviderTimeoutError,
+        _dependency_handler(504, "PAYMENT_PROVIDER_TIMEOUT", "Provedor excedeu o timeout"),
+    )
+    app.add_exception_handler(
+        PaymentProviderUnavailableError,
+        _dependency_handler(503, "PAYMENT_PROVIDER_UNAVAILABLE", "Provedor indisponível"),
+    )
+    app.add_exception_handler(
+        PaymentProviderRejectedError,
+        _dependency_handler(502, "PAYMENT_PROVIDER_REJECTED", "Provedor rejeitou a operação"),
+    )
+    app.add_exception_handler(
+        PaymentProviderContractError,
+        _dependency_handler(
+            502,
+            "PAYMENT_PROVIDER_CONTRACT_INVALID",
+            "Resposta incompatível do provedor",
+        ),
     )
     app.include_router(health_router)
     app.include_router(v1_router)

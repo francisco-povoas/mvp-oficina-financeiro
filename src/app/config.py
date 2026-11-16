@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     publisher_contract_schema_path: str = (
         "contracts/messages/financial-events.v1.schema.json"
     )
+    payment_provider: Literal["simulated", "mercado_pago"] = "simulated"
+    mercado_pago_access_token: str = ""
+    mercado_pago_webhook_secret: str = ""
+    mercado_pago_api_base_url: str = "https://api.mercadopago.com"
+    mercado_pago_notification_url: str = ""
+    mercado_pago_currency: str = "BRL"
+    mercado_pago_connect_timeout_seconds: float = 2.0
+    mercado_pago_read_timeout_seconds: float = 5.0
+    mercado_pago_max_attempts: int = 3
 
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 
@@ -48,6 +57,27 @@ class Settings(BaseSettings):
             raise ValueError("DYNAMODB_ENDPOINT_URL must be omitted in production")
         if self.environment == "prod" and self.jwt_secret_key == "unsafe":
             raise ValueError("JWT_SECRET_KEY must be provided in production")
+        if self.payment_provider == "mercado_pago":
+            missing = [
+                name
+                for name, value in {
+                    "MERCADO_PAGO_ACCESS_TOKEN": self.mercado_pago_access_token,
+                    "MERCADO_PAGO_WEBHOOK_SECRET": self.mercado_pago_webhook_secret,
+                    "MERCADO_PAGO_NOTIFICATION_URL": self.mercado_pago_notification_url,
+                }.items()
+                if not value.strip()
+            ]
+            if missing:
+                raise ValueError(f"Mercado Pago settings are required: {', '.join(missing)}")
+            if not self.mercado_pago_notification_url.startswith("https://"):
+                raise ValueError("MERCADO_PAGO_NOTIFICATION_URL must use HTTPS")
+            if self.mercado_pago_max_attempts <= 0:
+                raise ValueError("MERCADO_PAGO_MAX_ATTEMPTS must be positive")
+            if min(
+                self.mercado_pago_connect_timeout_seconds,
+                self.mercado_pago_read_timeout_seconds,
+            ) <= 0:
+                raise ValueError("Mercado Pago timeouts must be positive")
 
     def validate_publisher_runtime(self) -> None:
         self.validate_runtime()
